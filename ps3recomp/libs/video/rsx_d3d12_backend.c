@@ -5091,11 +5091,13 @@ skip_dump_consider: ;
         if (s_tt0 == 0) s_tt0 = tnow;
         if (tnow - s_tt0 >= 1000 && s_d3d.hwnd) {
             extern char g_rsx_title_base[128];
-            char tb[256];
-            snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u",
+            char tb[256], res[64];
+            extern int rsx_live_draw_res_text(char* out, unsigned cap);   /* GOWA: internal / output size */
+            if (!rsx_live_draw_res_text(res, sizeof res)) snprintf(res, sizeof res, "%ux%u", s_d3d.width, s_d3d.height);
+            snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %s",
                      g_rsx_title_base,
                      s_tframes * 1000.0 / (double)(tnow - s_tt0),
-                     s_dbg_last_draws, s_d3d.width, s_d3d.height);
+                     s_dbg_last_draws, res);
             /* GOWA: the title (PARAM.SFO) is UTF-8 -- "Ascension™" came out as
              * "Ascensionâ„¢" through the ANSI call. */
             { wchar_t tw[256];

@@ -434,6 +434,7 @@ typedef struct {
 static ld_state g;
 #define LD_PX(v) ((v) * g.res_scale)
 static int ld_fsr_on(void);   /* GOWA_FSR, below */
+static u32 g_ld_out_w, g_ld_out_h;   /* GOWA_FSR: the swap chain's size */
 
 /* GOWA (24/10): the D3D12 state sink_end_impl last put on g.list, so a draw skips the
  * calls that would set the same thing again (~15 driver calls a draw, ~2,500 draws a
@@ -512,6 +513,10 @@ static ID3D12GraphicsCommandList* s_osd_list;
 static u64 s_osd_alloc_fence[3];
 static u32 s_osd_ai, s_osd_falhou;
 static char s_osd_txt[96];
+static char s_osd_txt2[96];   /* GOWA: second line -- resolution (internal -> output, FSR) and frame generation */
+int rsx_live_draw_framegen_on(void);
+int rsx_live_draw_res_text(char* out, unsigned cap);
+double rsx_live_draw_get_present_fps(void);
 static volatile LONG s_osd_gpu_pct = -1, s_osd_vram_mb = -1, s_osd_vram_tot_mb = -1;
 static volatile LONG s_osd_temp_cpu = -1, s_osd_temp_gpu = -1, s_osd_temp_cpu_max = -1, s_osd_temp_gpu_max = -1;
 LUID g_ld_osd_luid;
@@ -596,7 +601,9 @@ static DWORD WINAPI ld_osd_amostrador(LPVOID arg)
                 free(it);
             }
         }
-        { const int tg = ld_osd_temp_gpu();
+        static int sin_temp = -1;
+        if (sin_temp < 0) { const char* e = getenv("GOWA_OSD_SAMPLER"); sin_temp = e && e[0] == '2'; }
+        if (!sin_temp) { const int tg = ld_osd_temp_gpu();
           if (tg > 0 && tg < 125) { InterlockedExchange(&s_osd_temp_gpu, tg); if (tg > s_osd_temp_gpu_max) InterlockedExchange(&s_osd_temp_gpu_max, tg); } }
         if (g_ld_osd_adapter) {
             DXGI_QUERY_VIDEO_MEMORY_INFO mi;
@@ -702,7 +709,9 @@ static int ld_osd_pipeline(void)
     if (FAILED(g.dev->lpVtbl->CreateCommandList(g.dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_osd_alloc[0], NULL,
                                                 &IID_ID3D12GraphicsCommandList, (void**)&s_osd_list))) return 0;
     s_osd_list->lpVtbl->Close(s_osd_list);
-    CreateThread(NULL, 0, ld_osd_amostrador, NULL, 0, NULL);
+    /* GOWA_OSD_SAMPLER=0: no sampler thread (no GPU %, temperatures, VRAM); =2: without the GPU temperature */
+    { const char* e = getenv("GOWA_OSD_SAMPLER");
+      if (!(e && e[0] == '0')) CreateThread(NULL, 0, ld_osd_amostrador, NULL, 0, NULL); }
     s_osd_falhou = 0;
     fprintf(stderr, "[osd] medidor na tela pronto (F10 liga e desliga)\n");
     return 1;
@@ -738,7 +747,13 @@ static void ld_osd_texto(void)
                        (double)ms.ullTotalPhys / 1073741824.0); }
         snprintf(s_osd_txt, sizeof s_osd_txt, "FPS %.1f  %.1f ms  CPU %d%%%s  GPU %s%s%s%s",
                  fps, fps > 0.05 ? 1000.0 / fps : 0.0, cpu, tc, gpu, tg, vram, ram);
-    } else snprintf(s_osd_txt, sizeof s_osd_txt, "FPS --");
+        char res[64] = "";
+        if (!rsx_live_draw_res_text(res, sizeof res)) snprintf(res, sizeof res, "--");
+        if (rsx_live_draw_framegen_on())
+            snprintf(s_osd_txt2, sizeof s_osd_txt2, "RES %s  FG SI (salida %.0f fps)", res, rsx_live_draw_get_present_fps());
+        else
+            snprintf(s_osd_txt2, sizeof s_osd_txt2, "RES %s  FG NO", res);
+    } else { snprintf(s_osd_txt, sizeof s_osd_txt, "FPS --"); s_osd_txt2[0] = 0; }
     t0 = agora.QuadPart; f0 = f1; i0 = i1; k0 = k1; u0 = u1;
 }
 static void ld_osd_desenha(void)
@@ -750,11 +765,24 @@ static void ld_osd_desenha(void)
       if (f10 && !s_osd_f10 && pid == GetCurrentProcessId()) s_osd_on = !s_osd_on;
       s_osd_f10 = f10; }
     if (!s_osd_on || !g.ready || !ld_osd_pipeline()) return;
+    /* GOWA (25/10): ld_swap_present also runs on the movie thread. The meter used
+     * the frame's fence, its counter (++g.fence_value) and its auto-reset event, so
+     * with two threads presenting a wait could miss its signal (the game hung) or a
+     * command list still in flight was reset (a crash). It has its own fence, value
+     * and event now, and a lock. */
+    static SRWLOCK s_osd_lock = SRWLOCK_INIT;
+    static ID3D12Fence* s_osd_fence; static u64 s_osd_fv; static HANDLE s_osd_ev;
+    AcquireSRWLockExclusive(&s_osd_lock);
+    if (!s_osd_fence) {
+        if (FAILED(g.dev->lpVtbl->CreateFence(g.dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&s_osd_fence)))
+            { s_osd_fence = NULL; ReleaseSRWLockExclusive(&s_osd_lock); return; }
+        s_osd_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    }
     ld_osd_texto();
     const u32 ai = s_osd_ai; s_osd_ai = (ai + 1u) % 3u;
-    if (s_osd_alloc_fence[ai] && g.fence->lpVtbl->GetCompletedValue(g.fence) < s_osd_alloc_fence[ai] &&
-        SUCCEEDED(g.fence->lpVtbl->SetEventOnCompletion(g.fence, s_osd_alloc_fence[ai], g.fence_event)))
-        WaitForSingleObject(g.fence_event, INFINITE);
+    if (s_osd_alloc_fence[ai] && s_osd_fence->lpVtbl->GetCompletedValue(s_osd_fence) < s_osd_alloc_fence[ai] &&
+        SUCCEEDED(s_osd_fence->lpVtbl->SetEventOnCompletion(s_osd_fence, s_osd_alloc_fence[ai], s_osd_ev)))
+        WaitForSingleObject(s_osd_ev, INFINITE);
     s_osd_alloc[ai]->lpVtbl->Reset(s_osd_alloc[ai]);
     ID3D12GraphicsCommandList* l = s_osd_list;
     l->lpVtbl->Reset(l, s_osd_alloc[ai], NULL);
@@ -782,14 +810,23 @@ static void ld_osd_desenha(void)
     l->lpVtbl->SetGraphicsRoot32BitConstants(l, 1, 32, k, 0);
     l->lpVtbl->IASetPrimitiveTopology(l, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     l->lpVtbl->DrawInstanced(l, 4, 1, 0, 0);
+    { const u32 n2 = (u32)strlen(s_osd_txt2);   /* second line, one text row (14 px) + 4 below */
+      if (n2) {
+          memset(&k[8], 0, sizeof(u32) * 24);
+          k[1] = 8u * esc + 18u * esc; k[3] = n2 < 96 ? n2 : 96;
+          memcpy(&k[8], s_osd_txt2, n2 < 96 ? n2 : 96);
+          l->lpVtbl->SetGraphicsRoot32BitConstants(l, 1, 32, k, 0);
+          l->lpVtbl->DrawInstanced(l, 4, 1, 0, 0);
+      } }
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET; b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     l->lpVtbl->ResourceBarrier(l, 1, &b);
     l->lpVtbl->Close(l);
     ID3D12CommandList* lists[] = {(ID3D12CommandList*)l};
     g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
-    const u64 v = ++g.fence_value;
-    g.queue->lpVtbl->Signal(g.queue, g.fence, v);
+    const u64 v = ++s_osd_fv;
+    g.queue->lpVtbl->Signal(g.queue, s_osd_fence, v);
     s_osd_alloc_fence[ai] = v;
+    ReleaseSRWLockExclusive(&s_osd_lock);
 }
 static HRESULT ld_swap_present(void)
 {
@@ -11525,6 +11562,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
             if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm)) { ow = dm.dmPelsWidth; oh = dm.dmPelsHeight; }
         }
         if (ow >= scd.Width && oh >= scd.Height && ow <= 7680 && oh <= 4320) { scd.Width = ow; scd.Height = oh; }
+        g_ld_out_w = scd.Width; g_ld_out_h = scd.Height;
         fprintf(stderr, "[fsr] interno %ux%u -> salida %ux%u\n", LD_PX(width), LD_PX(height), scd.Width, scd.Height);
     }
     scd.SampleDesc.Count = 1; scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -12357,12 +12395,12 @@ static D3D12_GPU_DESCRIPTOR_HANDLE ld_fsr_srv(u32 slot, ID3D12Resource* res)
 }
 /* EASU from `src` (a pixel-shader resource) into the output-size middle texture,
  * then RCAS into backbuffer `bbi` (in RENDER_TARGET state). 0 = not done. */
-static int ld_present_fsr(ID3D12Resource* src, u32 bbi)
+static int ld_present_fsr_to(ID3D12Resource* src, ID3D12Resource* dst, D3D12_CPU_DESCRIPTOR_HANDLE dst_rtv)
 {
-    if (!src || !ld_fsr_pipeline()) return 0;
+    if (!src || !dst || !ld_fsr_pipeline()) return 0;
     D3D12_RESOURCE_DESC sd, bd;
     src->lpVtbl->GetDesc(src, &sd);
-    g.backbuf[bbi]->lpVtbl->GetDesc(g.backbuf[bbi], &bd);
+    dst->lpVtbl->GetDesc(dst, &bd);
     const u32 ow = (u32)bd.Width, oh = bd.Height;
     if (!s_fsr_mid || s_fsr_mid_w != ow || s_fsr_mid_h != oh) {
         if (s_fsr_mid) { retire_texture(s_fsr_mid); s_fsr_mid = NULL; }
@@ -12408,8 +12446,7 @@ static int ld_present_fsr(ID3D12Resource* src, u32 bbi)
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
     /* RCAS -> backbuffer (reads the middle at its own size) */
     k[0] = (float)ow; k[1] = (float)oh;
-    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(bbi);
-    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
+    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &dst_rtv, FALSE, NULL);
     g.list->lpVtbl->SetPipelineState(g.list, s_fsr_rcas);
     g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 0, ld_fsr_srv(1, s_fsr_mid));
     g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 1, 8, k, 0);
@@ -12463,6 +12500,17 @@ static void ld_dump_rt_ppm(const char* path, ID3D12Resource* rt)
     }
     rb->lpVtbl->Release(rb);
 }
+/* For the window title: "2560x1440" (internal), or "2560x1440 -> 3840x2160 FSR".
+ * 0 when live draw is not up. */
+int rsx_live_draw_res_text(char* out, unsigned cap)
+{
+    if (!g.ready || !g.width) return 0;
+    if (g_ld_out_w && (g_ld_out_w != LD_PX(g.width) || g_ld_out_h != LD_PX(g.height)))
+        snprintf(out, cap, "%ux%u -> %ux%u FSR", LD_PX(g.width), LD_PX(g.height), g_ld_out_w, g_ld_out_h);
+    else
+        snprintf(out, cap, "%ux%u", LD_PX(g.width), LD_PX(g.height));
+    return 1;
+}
 /* The scaled present: FSR when it is on and the picture goes up, else the blit. */
 static int ld_present_scaled(u32 srv_slot, ID3D12Resource* src, u32 bbi)
 {
@@ -12470,7 +12518,7 @@ static int ld_present_scaled(u32 srv_slot, ID3D12Resource* src, u32 bbi)
         D3D12_RESOURCE_DESC sd, bd;
         src->lpVtbl->GetDesc(src, &sd);
         g.backbuf[bbi]->lpVtbl->GetDesc(g.backbuf[bbi], &bd);
-        if ((sd.Width < bd.Width || sd.Height < bd.Height) && ld_present_fsr(src, bbi)) return 1;
+        if ((sd.Width < bd.Width || sd.Height < bd.Height) && ld_present_fsr_to(src, g.backbuf[bbi], rtv_handle(bbi))) return 1;
     }
     return ld_present_blit(srv_slot, bbi);
 }
@@ -13596,10 +13644,19 @@ static void ld_fg_present_real(void)
         if (!ok) { s_fg.list = NULL; s_fg.pending = 0; return; }
         s_fg.list->lpVtbl->Close(s_fg.list);
     }
+    /* GOWA (25/10): own fence, value and event -- this runs on the present thread
+     * too, and ++g.fence_value here broke ld_flush's "the next signal is
+     * fence_value + 1" (and raced the RSX thread's waits on g.fence_event). */
+    static ID3D12Fence* s_fgf; static u64 s_fgv; static HANDLE s_fge;
+    if (!s_fgf) {
+        if (FAILED(g.dev->lpVtbl->CreateFence(g.dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&s_fgf)))
+            { s_fgf = NULL; s_fg.pending = 0; return; }
+        s_fge = CreateEventA(NULL, FALSE, FALSE, NULL);
+    }
     const u32 ai = s_fg.ai; s_fg.ai = (ai + 1u) % 3u;
-    if (s_fg.alloc_fence[ai] && g.fence->lpVtbl->GetCompletedValue(g.fence) < s_fg.alloc_fence[ai] &&
-        SUCCEEDED(g.fence->lpVtbl->SetEventOnCompletion(g.fence, s_fg.alloc_fence[ai], g.fence_event)))
-        WaitForSingleObject(g.fence_event, INFINITE);
+    if (s_fg.alloc_fence[ai] && s_fgf->lpVtbl->GetCompletedValue(s_fgf) < s_fg.alloc_fence[ai] &&
+        SUCCEEDED(s_fgf->lpVtbl->SetEventOnCompletion(s_fgf, s_fg.alloc_fence[ai], s_fge)))
+        WaitForSingleObject(s_fge, INFINITE);
     s_fg.alloc[ai]->lpVtbl->Reset(s_fg.alloc[ai]);
     ID3D12GraphicsCommandList* l = s_fg.list;
     l->lpVtbl->Reset(l, s_fg.alloc[ai], NULL);
@@ -13613,8 +13670,8 @@ static void ld_fg_present_real(void)
     l->lpVtbl->Close(l);
     ID3D12CommandList* lists[] = {(ID3D12CommandList*)l};
     g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
-    const u64 v = ++g.fence_value;
-    g.queue->lpVtbl->Signal(g.queue, g.fence, v);
+    const u64 v = ++s_fgv;
+    g.queue->lpVtbl->Signal(g.queue, s_fgf, v);
     s_fg.alloc_fence[ai] = v;
     if (g.ready) ld_swap_present();
     s_fg.pending = 0;
@@ -13640,7 +13697,11 @@ static int ld_fg_present_guest(ID3D12Resource* src, u32 src_srv)
     if (!table.ptr) return 0;
     ld_fg_barrier(src, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     ld_fg_barrier(s_fg.fg[k], FG_READ, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    {
+    /* GOWA: with GOWA_FSR the frame goes up through EASU + RCAS here too */
+    D3D12_RESOURCE_DESC sd0; src->lpVtbl->GetDesc(src, &sd0);
+    if (ld_fsr_on() && (sd0.Width < bd.Width || sd0.Height < bd.Height) &&
+        ld_present_fsr_to(src, s_fg.fg[k], ld_fg_cpu(s_fg.rtv, s_fg.rtv_step, (u32)k))) {
+    } else {
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv = ld_fg_cpu(s_fg.rtv, s_fg.rtv_step, (u32)k);
         g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
         D3D12_VIEWPORT vp = {0, 0, (float)bd.Width, (float)bd.Height, 0.0f, 1.0f};

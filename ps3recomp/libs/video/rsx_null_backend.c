@@ -320,9 +320,11 @@ int rsx_null_backend_pump_messages(void)
         if (fps <= 0.0)
             fps = (s_state.frame_count - s_state.title_frames) * 1000.0 /
                   (double)(now - s_state.title_time);
-        char tb[256];
-        snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u", s_state.title, fps,
-                 rsx_live_draw_get_last_draws(), s_state.width, s_state.height);
+        char tb[256], res[64];
+        extern int rsx_live_draw_res_text(char* out, unsigned cap);   /* GOWA: internal / output size */
+        if (!rsx_live_draw_res_text(res, sizeof res)) snprintf(res, sizeof res, "%ux%u", s_state.width, s_state.height);
+        snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %s", s_state.title, fps,
+                 rsx_live_draw_get_last_draws(), res);
         /* GOWA: the title (PARAM.SFO) is UTF-8 -- "Ascension™" came out as
          * "Ascensionâ„¢" through the ANSI call. */
         { wchar_t tw[256];
