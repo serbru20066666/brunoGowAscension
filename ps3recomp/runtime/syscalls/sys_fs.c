@@ -89,10 +89,61 @@ static void fs_normalize_sep(char* p) {
  *
  * All three path translators call this -- sys_fs, cellFs and ppu_fs each do
  * their own translation (see docs), and a guest path can arrive at any of them. */
+/* PS3_FS_ALIAS="from=to,from=to": a missing file whose name contains `from`
+ * is looked up with `to` in its place. A US executable on a European disc asks
+ * for the US language archives: with the console in Spanish God of War opens
+ * LA_SPANISH.PSARC (Latin American), and the European disc has SPANISH.PSARC
+ * (same files inside): without it the cinematics' voice and music streams
+ * (SOUNDS/STREAMS/CINEMATICS/*.XVAG) were missing and the cut scenes ran mute.
+ * Default "LA_SPANISH=SPANISH,BR_PORTUGUESE=PORTUGUESE"; "0" turns it off. */
+static int fs_try_alias(char* path, size_t cap)
+{
+    static char spec[512]; static int init;
+    if (!init) {
+        init = 1;
+        const char* e = getenv("PS3_FS_ALIAS");
+        snprintf(spec, sizeof spec, "%s", e ? e : "LA_SPANISH=SPANISH,BR_PORTUGUESE=PORTUGUESE");
+        if (spec[0] == '0' && !spec[1]) spec[0] = 0;
+    }
+    if (!spec[0]) return 0;
+    const char* base = strrchr(path, '/');
+    const char* b2 = strrchr(path, '\\');
+    if (b2 && (!base || b2 > base)) base = b2;
+    base = base ? base + 1 : path;
+    for (const char* s = spec; *s; ) {
+        const char* eq = strchr(s, '='); if (!eq) break;
+        const char* end = strchr(eq, ','); if (!end) end = eq + strlen(eq);
+        char from[64], to[64];
+        const size_t nf = (size_t)(eq - s), nt = (size_t)(end - eq - 1);
+        if (nf && nf < sizeof from && nt < sizeof to) {
+            memcpy(from, s, nf); from[nf] = 0; memcpy(to, eq + 1, nt); to[nt] = 0;
+            const char* hit = strstr(base, from);
+            if (hit) {
+                char alt[1024]; struct stat st;
+                const size_t head = (size_t)(hit - path);
+                if (head + nt + strlen(hit + nf) + 1 < sizeof alt) {
+                    memcpy(alt, path, head);
+                    snprintf(alt + head, sizeof alt - head, "%s%s", to, hit + nf);
+                    if (stat(alt, &st) == 0) {
+                        static int said;
+                        if (said++ < 16) fprintf(stderr, "[fs] alias: %s -> %s\n", path, alt);
+                        snprintf(path, cap, "%s", alt);
+                        return 1;
+                    }
+                }
+            }
+        }
+        s = *end ? end + 1 : end;
+    }
+    return 0;
+}
+
 void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 {
     struct stat st;
     if (!path || !*path || stat(path, &st) == 0)
+        return;
+    if (fs_try_alias(path, cap))
         return;
     char* p = strstr(path, "/PS3_GAME/");
     if (!p) {
