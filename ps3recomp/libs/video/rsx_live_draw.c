@@ -111,6 +111,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <dxgi1_6.h>   /* GOWA_GPU: EnumAdapterByGpuPreference */
 #include <d3dcompiler.h>
 #include "rsx_vertex_formats.h"
+#include "rsx_window_place.h"   /* GOWA: rsx_toggle_borderless (GOWA_FULLSCREEN) */
 #include <sys/stat.h>
 
 #pragma comment(lib, "d3d12.lib")
@@ -432,6 +433,7 @@ typedef struct {
 
 static ld_state g;
 #define LD_PX(v) ((v) * g.res_scale)
+static int ld_fsr_on(void);   /* GOWA_FSR, below */
 
 /* GOWA (24/10): the D3D12 state sink_end_impl last put on g.list, so a draw skips the
  * calls that would set the same thing again (~15 driver calls a draw, ~2,500 draws a
@@ -11515,6 +11517,16 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     /* swap chain bound to the runtime's HWND */
     DXGI_SWAP_CHAIN_DESC1 scd = {0};
     scd.Width = LD_PX(width); scd.Height = LD_PX(height); scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;   /* GOWA_RES_SCALE */
+    if (ld_fsr_on()) {   /* GOWA_FSR: the display's size; the picture goes up through EASU + RCAS */
+        const char* ew = getenv("GOWA_OUT_W"); const char* eh = getenv("GOWA_OUT_H");
+        u32 ow = ew ? (u32)atoi(ew) : 0, oh = eh ? (u32)atoi(eh) : 0;
+        if (!ow || !oh) {
+            DEVMODEA dm; memset(&dm, 0, sizeof dm); dm.dmSize = sizeof dm;
+            if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm)) { ow = dm.dmPelsWidth; oh = dm.dmPelsHeight; }
+        }
+        if (ow >= scd.Width && oh >= scd.Height && ow <= 7680 && oh <= 4320) { scd.Width = ow; scd.Height = oh; }
+        fprintf(stderr, "[fsr] interno %ux%u -> salida %ux%u\n", LD_PX(width), LD_PX(height), scd.Width, scd.Height);
+    }
     scd.SampleDesc.Count = 1; scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     { const char* e = getenv("GOWA_SWAP_BUFFERS");
       if (e) { const int n = atoi(e); if (n >= 2 && n <= LD_SWAP_BUFFERS) g_ld_swap_count = (u32)n; } }
@@ -11541,7 +11553,13 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     }
     sc1->lpVtbl->QueryInterface(sc1, &IID_IDXGISwapChain3, (void**)&g.swap);
     sc1->lpVtbl->Release(sc1);
+    /* GOWA: no DXGI Alt+Enter (exclusive full screen without a resize froze the
+     * picture); the window procedure toggles borderless full screen instead
+     * (rsx_window_place.h). GOWA_FULLSCREEN=1 starts that way. */
+    factory->lpVtbl->MakeWindowAssociation(factory, (HWND)hwnd, DXGI_MWA_NO_ALT_ENTER);
     factory->lpVtbl->Release(factory);
+    { const char* e = getenv("GOWA_FULLSCREEN");
+      if (e && e[0] == '1') rsx_toggle_borderless((HWND)hwnd); }
 
     /* RTV heap: [0..1] backbuffers, [2..] surface cache */
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
@@ -12162,6 +12180,301 @@ static int ld_present_blit(u32 srv_slot, u32 bbi)
     g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
     return 1;
 }
+/* ---- GOWA_FSR=1 (25/10): FidelityFX Super Resolution 1 style upscaling ----
+ * The swap chain is made at the display's size (GOWA_OUT_W/H, else the primary
+ * monitor's mode) and the presented surface goes up in two passes: EASU, edge
+ * adaptive spatial upsampling (12 taps, a Lanczos-2 like kernel stretched along
+ * the local edge, clamped to the 2x2 neighbourhood) into an output-size texture,
+ * then RCAS, contrast adaptive sharpening (GOWA_FSR_SHARP = stops, 0 = sharpest,
+ * default 0.2) into the backbuffer. Our own HLSL of AMD's published algorithms
+ * (FSR 1.0, MIT). FSR 2/3 need motion vectors the game does not give and FSR 4
+ * needs an RDNA 4 GPU. Own root signature (t0 + 8 constants) and descriptor heaps. */
+static int g_ld_fsr = -1;
+static float g_ld_fsr_sharp = 0.2f;
+static int ld_fsr_on(void)
+{
+    if (g_ld_fsr < 0) {
+        const char* e = getenv("GOWA_FSR");
+        g_ld_fsr = (e && e[0] == '1') ? 1 : 0;
+        const char* s = getenv("GOWA_FSR_SHARP");
+        if (s) { g_ld_fsr_sharp = (float)atof(s); if (g_ld_fsr_sharp < 0) g_ld_fsr_sharp = 0; if (g_ld_fsr_sharp > 2) g_ld_fsr_sharp = 2; }
+    }
+    return g_ld_fsr;
+}
+static ID3D12RootSignature* s_fsr_rs;
+static ID3D12PipelineState *s_fsr_easu, *s_fsr_rcas;
+static ID3D12DescriptorHeap *s_fsr_srv_heap, *s_fsr_rtv_heap;
+static ID3D12Resource* s_fsr_mid;
+static u32 s_fsr_mid_w, s_fsr_mid_h, s_fsr_srv_step;
+static int ld_fsr_pipeline(void)
+{
+    static int failed;
+    if (s_fsr_rcas) return 1;
+    if (failed) return 0;
+    failed = 1;
+    D3D12_DESCRIPTOR_RANGE r = {0};
+    r.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER rp[2] = {0};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable.NumDescriptorRanges = 1; rp[0].DescriptorTable.pDescriptorRanges = &r;
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants.ShaderRegister = 0; rp[1].Constants.Num32BitValues = 8;
+    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {0};
+    rsd.NumParameters = 2; rsd.pParameters = rp;
+    ID3DBlob* sig = NULL; ID3DBlob* err = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
+        if (err) err->lpVtbl->Release(err);
+        return 0;
+    }
+    HRESULT hr = g.dev->lpVtbl->CreateRootSignature(g.dev, 0, sig->lpVtbl->GetBufferPointer(sig),
+                                                    sig->lpVtbl->GetBufferSize(sig),
+                                                    &IID_ID3D12RootSignature, (void**)&s_fsr_rs);
+    sig->lpVtbl->Release(sig);
+    if (FAILED(hr)) return 0;
+    static const char src[] =
+        "struct V { float4 p : SV_Position; };\n"
+        "V vs(uint id : SV_VertexID) { V o; float2 uv = float2((id << 1) & 2, id & 2);\n"
+        "  o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
+        "Texture2D t0 : register(t0);\n"
+        "cbuffer C : register(b0) { float4 k0; float4 k1; };\n"   /* k0 = in w,h, out w,h; k1.x = sharpness (linear) */
+        "float3 T(int2 q) { q = clamp(q, int2(0, 0), int2(k0.xy) - 1); return saturate(t0.Load(int3(q, 0)).rgb); }\n"
+        "float L(float3 c) { return c.b * 0.5 + (c.r * 0.5 + c.g); }\n"
+        /* direction and length from one bilinear corner and its cross (a up, b left, c centre, d right, e down) */
+        "void SetF(inout float2 dir, inout float len, float w, float a, float b, float c, float d, float e) {\n"
+        "  float dc = d - c, cb = c - b, lx = max(abs(dc), abs(cb)); lx = lx > 0 ? 1.0 / lx : 0;\n"
+        "  float dx = d - b; dir.x += dx * w; lx = saturate(abs(dx) * lx); lx *= lx; len += lx * w;\n"
+        "  float ec = e - c, ca = c - a, ly = max(abs(ec), abs(ca)); ly = ly > 0 ? 1.0 / ly : 0;\n"
+        "  float dy = e - a; dir.y += dy * w; ly = saturate(abs(dy) * ly); ly *= ly; len += ly * w; }\n"
+        "void Tap(inout float3 ac, inout float aw, float2 off, float2 dir, float2 len2, float lob, float clp, float3 c) {\n"
+        "  float2 v; v.x = off.x * dir.x + off.y * dir.y; v.y = off.x * -dir.y + off.y * dir.x; v *= len2;\n"
+        "  float d2 = min(v.x * v.x + v.y * v.y, clp);\n"
+        "  float wb = 2.0 / 5.0 * d2 - 1.0, wa = lob * d2 - 1.0; wb *= wb; wa *= wa;\n"
+        "  wb = 25.0 / 16.0 * wb - (25.0 / 16.0 - 1.0); float w = wb * wa; ac += c * w; aw += w; }\n"
+        "float4 easu(V i) : SV_Target {\n"
+        "  float2 pp = (floor(i.p.xy) + 0.5) * (k0.xy / k0.zw) - 0.5; float2 fp = floor(pp); pp -= fp; int2 o = int2(fp);\n"
+        "  float3 b = T(o + int2(0,-1)), c = T(o + int2(1,-1));\n"
+        "  float3 e = T(o + int2(-1,0)), f = T(o), g = T(o + int2(1,0)), h = T(o + int2(2,0));\n"
+        "  float3 ii = T(o + int2(-1,1)), j = T(o + int2(0,1)), k = T(o + int2(1,1)), l = T(o + int2(2,1));\n"
+        "  float3 n = T(o + int2(0,2)), oo = T(o + int2(1,2));\n"
+        "  float bL = L(b), cL = L(c), eL = L(e), fL = L(f), gL = L(g), hL = L(h), iL = L(ii), jL = L(j), kL = L(k), lL = L(l), nL = L(n), oL = L(oo);\n"
+        "  float2 dir = 0; float len = 0;\n"
+        "  SetF(dir, len, (1 - pp.x) * (1 - pp.y), bL, eL, fL, gL, jL);\n"
+        "  SetF(dir, len, pp.x * (1 - pp.y), cL, fL, gL, hL, kL);\n"
+        "  SetF(dir, len, (1 - pp.x) * pp.y, fL, iL, jL, kL, nL);\n"
+        "  SetF(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);\n"
+        "  float dr = dir.x * dir.x + dir.y * dir.y; bool z = dr < 1.0 / 32768.0;\n"
+        "  dr = z ? 1.0 : rsqrt(dr); dir.x = z ? 1.0 : dir.x; dir *= dr;\n"
+        "  len = len * 0.5; len *= len;\n"
+        "  float st = (dir.x * dir.x + dir.y * dir.y) / max(abs(dir.x), abs(dir.y));\n"
+        "  float2 len2 = float2(1.0 + (st - 1.0) * len, 1.0 - 0.5 * len);\n"
+        "  float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len; float clp = 1.0 / lob;\n"
+        "  float3 ac = 0; float aw = 0;\n"
+        "  Tap(ac, aw, float2( 0,-1) - pp, dir, len2, lob, clp, b);\n"
+        "  Tap(ac, aw, float2( 1,-1) - pp, dir, len2, lob, clp, c);\n"
+        "  Tap(ac, aw, float2(-1, 1) - pp, dir, len2, lob, clp, ii);\n"
+        "  Tap(ac, aw, float2( 0, 1) - pp, dir, len2, lob, clp, j);\n"
+        "  Tap(ac, aw, float2( 0, 0) - pp, dir, len2, lob, clp, f);\n"
+        "  Tap(ac, aw, float2(-1, 0) - pp, dir, len2, lob, clp, e);\n"
+        "  Tap(ac, aw, float2( 1, 1) - pp, dir, len2, lob, clp, k);\n"
+        "  Tap(ac, aw, float2( 2, 1) - pp, dir, len2, lob, clp, l);\n"
+        "  Tap(ac, aw, float2( 2, 0) - pp, dir, len2, lob, clp, h);\n"
+        "  Tap(ac, aw, float2( 1, 0) - pp, dir, len2, lob, clp, g);\n"
+        "  Tap(ac, aw, float2( 1, 2) - pp, dir, len2, lob, clp, oo);\n"
+        "  Tap(ac, aw, float2( 0, 2) - pp, dir, len2, lob, clp, n);\n"
+        "  float3 mn = min(min(f, g), min(j, k)), mx = max(max(f, g), max(j, k));\n"
+        "  return float4(clamp(ac / aw, mn, mx), 1); }\n"
+        "float4 rcas(V i) : SV_Target {\n"
+        "  int2 q = int2(i.p.xy);\n"
+        "  float3 b = T(q + int2(0,-1)), d = T(q + int2(-1,0)), e = T(q), f = T(q + int2(1,0)), h = T(q + int2(0,1));\n"
+        "  float3 mn4 = min(min(b, d), min(f, h)), mx4 = max(max(b, d), max(f, h));\n"
+        "  float3 hmin = min(mn4, e) / (4.0 * mx4 + 1e-5);\n"
+        "  float3 hmax = (1.0 - max(mx4, e)) / (4.0 * mn4 - 4.0 - 1e-5);\n"
+        "  float3 lb = max(-hmin, hmax);\n"
+        "  float lobe = max(-(0.25 - 1.0 / 16.0), min(max(lb.r, max(lb.g, lb.b)), 0.0)) * k1.x;\n"
+        "  return float4(saturate((lobe * (b + d + h + f) + e) / (4.0 * lobe + 1.0)), 1); }\n";
+    ID3DBlob *vsb = NULL, *eb = NULL, *rb = NULL;
+    const char* ents[3] = {"vs", "easu", "rcas"}; const char* tgts[3] = {"vs_5_0", "ps_5_0", "ps_5_0"};
+    ID3DBlob** outs[3] = {&vsb, &eb, &rb};
+    for (int s = 0; s < 3; s++)
+        if (FAILED(D3DCompile(src, sizeof src - 1, "ld_fsr", NULL, NULL, ents[s], tgts[s], D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, outs[s], &err))) {
+            if (err) { fprintf(stderr, "[fsr] %s: %s\n", ents[s], (const char*)err->lpVtbl->GetBufferPointer(err)); err->lpVtbl->Release(err); }
+            for (int q = 0; q < 3; q++) if (*outs[q]) (*outs[q])->lpVtbl->Release(*outs[q]);
+            return 0;
+        }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    pd.pRootSignature = s_fsr_rs;
+    pd.VS.pShaderBytecode = vsb->lpVtbl->GetBufferPointer(vsb);
+    pd.VS.BytecodeLength = vsb->lpVtbl->GetBufferSize(vsb);
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.SampleMask = 0xFFFFFFFFu;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    pd.PS.pShaderBytecode = eb->lpVtbl->GetBufferPointer(eb);
+    pd.PS.BytecodeLength = eb->lpVtbl->GetBufferSize(eb);
+    hr = g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev, &pd, &IID_ID3D12PipelineState, (void**)&s_fsr_easu);
+    if (SUCCEEDED(hr)) {
+        pd.PS.pShaderBytecode = rb->lpVtbl->GetBufferPointer(rb);
+        pd.PS.BytecodeLength = rb->lpVtbl->GetBufferSize(rb);
+        hr = g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev, &pd, &IID_ID3D12PipelineState, (void**)&s_fsr_rcas);
+    }
+    vsb->lpVtbl->Release(vsb); eb->lpVtbl->Release(eb); rb->lpVtbl->Release(rb);
+    if (FAILED(hr)) { fprintf(stderr, "[fsr] PSO hr=0x%08lX\n", (unsigned long)hr); return 0; }
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 2;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_fsr_srv_heap))) return 0;
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 1; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    if (FAILED(g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_fsr_rtv_heap))) return 0;
+    s_fsr_srv_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    fprintf(stderr, "[fsr] EASU + RCAS listos (nitidez %.2f)\n", g_ld_fsr_sharp);
+    failed = 0;
+    return 1;
+}
+static D3D12_GPU_DESCRIPTOR_HANDLE ld_fsr_srv(u32 slot, ID3D12Resource* res)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE c;
+    s_fsr_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_fsr_srv_heap, &c);
+    c.ptr += (SIZE_T)slot * s_fsr_srv_step;
+    D3D12_RESOURCE_DESC rd; res->lpVtbl->GetDesc(res, &rd);
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
+    sv.Format = rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM
+              : rd.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS ? DXGI_FORMAT_R16G16B16A16_FLOAT : rd.Format;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    g.dev->lpVtbl->CreateShaderResourceView(g.dev, res, &sv, c);
+    D3D12_GPU_DESCRIPTOR_HANDLE gh;
+    s_fsr_srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_fsr_srv_heap, &gh);
+    gh.ptr += (UINT64)slot * s_fsr_srv_step;
+    return gh;
+}
+/* EASU from `src` (a pixel-shader resource) into the output-size middle texture,
+ * then RCAS into backbuffer `bbi` (in RENDER_TARGET state). 0 = not done. */
+static int ld_present_fsr(ID3D12Resource* src, u32 bbi)
+{
+    if (!src || !ld_fsr_pipeline()) return 0;
+    D3D12_RESOURCE_DESC sd, bd;
+    src->lpVtbl->GetDesc(src, &sd);
+    g.backbuf[bbi]->lpVtbl->GetDesc(g.backbuf[bbi], &bd);
+    const u32 ow = (u32)bd.Width, oh = bd.Height;
+    if (!s_fsr_mid || s_fsr_mid_w != ow || s_fsr_mid_h != oh) {
+        if (s_fsr_mid) { retire_texture(s_fsr_mid); s_fsr_mid = NULL; }
+        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = ow; rd.Height = oh; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL, &IID_ID3D12Resource, (void**)&s_fsr_mid)))
+            { s_fsr_mid = NULL; return 0; }
+        s_fsr_mid_w = ow; s_fsr_mid_h = oh;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+        s_fsr_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_fsr_rtv_heap, &rtv);
+        g.dev->lpVtbl->CreateRenderTargetView(g.dev, s_fsr_mid, NULL, rtv);
+    }
+    float k[8] = { (float)sd.Width, (float)sd.Height, (float)ow, (float)oh, exp2f(-g_ld_fsr_sharp), 0, 0, 0 };
+    D3D12_VIEWPORT vp = {0, 0, (float)ow, (float)oh, 0.0f, 1.0f};
+    D3D12_RECT sc = {0, 0, (LONG)ow, (LONG)oh};
+    ID3D12DescriptorHeap* heaps[] = {s_fsr_srv_heap};
+    g.list->lpVtbl->SetDescriptorHeaps(g.list, 1, heaps); ld_state_dirty();
+    g.list->lpVtbl->SetGraphicsRootSignature(g.list, s_fsr_rs);
+    g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->lpVtbl->RSSetViewports(g.list, 1, &vp);
+    g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+    /* EASU -> middle */
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = s_fsr_mid;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    D3D12_CPU_DESCRIPTOR_HANDLE mrtv;
+    s_fsr_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_fsr_rtv_heap, &mrtv);
+    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &mrtv, FALSE, NULL);
+    g.list->lpVtbl->SetPipelineState(g.list, s_fsr_easu);
+    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 0, ld_fsr_srv(0, src));
+    g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 1, 8, k, 0);
+    g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    /* RCAS -> backbuffer (reads the middle at its own size) */
+    k[0] = (float)ow; k[1] = (float)oh;
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(bbi);
+    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
+    g.list->lpVtbl->SetPipelineState(g.list, s_fsr_rcas);
+    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 0, ld_fsr_srv(1, s_fsr_mid));
+    g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 1, 8, k, 0);
+    g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
+    return 1;
+}
+/* An RGBA8 render target (in RENDER_TARGET state, left so) to a .ppm. */
+static void ld_dump_rt_ppm(const char* path, ID3D12Resource* rt)
+{
+    D3D12_RESOURCE_DESC rd; rt->lpVtbl->GetDesc(rt, &rd);
+    const u32 w = (u32)rd.Width, h = rd.Height, pitch = (w * 4 + 255) & ~255u;
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)pitch * h;
+    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* rb = NULL;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&rb))) return;
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = rt;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
+    src.pResource = rt; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dst.PlacedFootprint.Footprint.Width = w; dst.PlacedFootprint.Footprint.Height = h;
+    dst.PlacedFootprint.Footprint.Depth = 1; dst.PlacedFootprint.Footprint.RowPitch = pitch;
+    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_flush(LD_FLUSH_READBACK);
+    u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)bd.Width};
+    if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, (void**)&px))) {
+        FILE* f = fopen(path, "wb");
+        if (f) {
+            fprintf(f, "P6\n%u %u\n255\n", w, h);
+            u8* row = (u8*)malloc((size_t)w * 3);
+            for (u32 y = 0; row && y < h; y++) {
+                const u8* s = px + (size_t)y * pitch;
+                for (u32 x = 0; x < w; x++) { row[x*3] = s[x*4]; row[x*3+1] = s[x*4+1]; row[x*3+2] = s[x*4+2]; }
+                fwrite(row, 1, (size_t)w * 3, f);
+            }
+            free(row); fclose(f);
+        }
+        D3D12_RANGE wr = {0, 0}; rb->lpVtbl->Unmap(rb, 0, &wr);
+    }
+    rb->lpVtbl->Release(rb);
+}
+/* The scaled present: FSR when it is on and the picture goes up, else the blit. */
+static int ld_present_scaled(u32 srv_slot, ID3D12Resource* src, u32 bbi)
+{
+    if (ld_fsr_on() && src) {
+        D3D12_RESOURCE_DESC sd, bd;
+        src->lpVtbl->GetDesc(src, &sd);
+        g.backbuf[bbi]->lpVtbl->GetDesc(g.backbuf[bbi], &bd);
+        if ((sd.Width < bd.Width || sd.Height < bd.Height) && ld_present_fsr(src, bbi)) return 1;
+    }
+    return ld_present_blit(srv_slot, bbi);
+}
+
 /* Guest-size texture the movie frames go through when the swap chain is
  * scaled (GOWA_RES_SCALE > 1). */
 static ID3D12Resource* s_movie_tex;
@@ -12251,7 +12564,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     int blitted = 0;
-    if (g.res_scale != 1) {
+    if (g.res_scale != 1 || ld_fsr_on()) {   /* GOWA_FSR: the backbuffer is the display's size */
         /* scaled swap chain: through a guest-size texture and the blit */
         if (s_movie_tex && (s_movie_tex_w != w || s_movie_tex_h != h)) {
             retire_texture(s_movie_tex); s_movie_tex = NULL;
@@ -12288,14 +12601,14 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
             b2[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
             b2[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
             g.list->lpVtbl->ResourceBarrier(g.list, 2, b2);
-            blitted = ld_present_blit(SRV_BLIT_SRC, bbi);
+            blitted = ld_present_scaled(SRV_BLIT_SRC, s_movie_tex, bbi);
             b.Transition.pResource = bb;
             b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
             b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
             g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
         }
     }
-    if (!blitted && !(g.res_scale != 1 && s_movie_tex)) {
+    if (!blitted && !((g.res_scale != 1 || ld_fsr_on()) && s_movie_tex)) {
     b.Transition.pResource = bb;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -13868,7 +14181,13 @@ void rsx_live_draw_present(u32 buffer_id)
             fprintf(stderr, "[present] superficie %llux%u fmt=%d -> backbuffer %llux%u: blit escalado\n",
                     (unsigned long long)sdesc.Width, sdesc.Height, (int)sdesc.Format,
                     (unsigned long long)bdesc.Width, bdesc.Height);
-        ld_present_blit(SRV_SURFACE_BASE + target, bbi);
+        ld_present_scaled(SRV_SURFACE_BASE + target, srcimg, bbi);
+        /* the dumped frame also as presented (after FSR / the scaled blit) */
+        if (dump_now) {
+            char path[MAX_PATH * 2];
+            snprintf(path, sizeof(path), "%s\\frame_%06u_out.ppm", dump_dir, dump_n - 1u);
+            ld_dump_rt_ppm(path, bb);
+        }
     }
 
     bar[0].Transition.StateBefore = src_use;
