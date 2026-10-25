@@ -139,17 +139,23 @@ function Nueva-Fila([string]$texto, [int]$tam, $opcion) {
     $menu.Children.Add($b) | Out-Null
     $f = [pscustomobject]@{ Borde = $b; Etiqueta = $l; Valor = $vt; Opcion = $opcion }
     [void]$Filas.Add($f)
-    $i = $Filas.Count - 1
-    $b.Add_MouseLeftButtonDown({ param($s, $e)
-        $script:Sel = [int]$s.Tag; Pintar
-        $f2 = $Filas[$script:Sel]
-        if ($f2.Opcion) {
-            $x = $e.GetPosition($s).X
-            Cambiar ($(if ($x -lt $s.ActualWidth * 0.55) { -1 } else { 1 }))
-        } elseif ($e.ClickCount -ge 1) { Activar }
-    }.GetNewClosure())
-    $b.Tag = $i
+    # the row's index in Tag; the handler is a plain script block (GetNewClosure would
+    # put it in its own module, where Cambiar, Pintar and $script:Sel are not seen)
+    $b.Tag = $Filas.Count - 1
+    $b.Background = [Windows.Media.Brushes]::Transparent   # clickable over its whole width
     $b.Cursor = [Windows.Input.Cursors]::Hand
+    $b.Add_MouseLeftButtonDown($script:ClicFila)
+}
+$script:ClicFila = {
+    param($s, $e)
+    $script:Sel = [int]$s.Tag
+    $f2 = $Filas[$script:Sel]
+    if ($f2.Opcion) {
+        # left half of the row: previous value, right half: next
+        $x = $e.GetPosition($s).X
+        Cambiar $(if ($x -lt $s.ActualWidth * 0.5) { -1 } else { 1 })
+    } else { Pintar; Activar }
+    $e.Handled = $true
 }
 Nueva-Fila 'JUGAR' 26 $null
 $sep = New-Object Windows.Controls.Border; $sep.Height = 1; $sep.Margin = '14,5,40,5'; $sep.Background = $tenue
@@ -168,7 +174,7 @@ function Texto-Valor($o) {
 function Pintar {
     for ($i = 0; $i -lt $Filas.Count; $i++) {
         $f = $Filas[$i]; $on = $i -eq $script:Sel
-        $f.Borde.Background = $(if ($on) { $brasa } else { $null })
+        $f.Borde.Background = $(if ($on) { $brasa } else { [Windows.Media.Brushes]::Transparent })
         $f.Borde.BorderBrush = $(if ($on) { $oro } else { $null })
         $f.Etiqueta.Foreground = $(if ($on) { $oro } else { $pergamino })
         if ($f.Opcion) {
@@ -230,7 +236,9 @@ $script:Reloj.Add_Tick({
     }
 })
 
-$win.Add_KeyDown({ param($s, $e)
+# PreviewKeyDown: WPF takes the arrow keys for focus navigation before KeyDown sees them
+$win.Add_PreviewKeyDown({ param($s, $e)
+    $h = $true
     switch ($e.Key) {
         'Up'     { $script:Sel = ($script:Sel - 1 + $Filas.Count) % $Filas.Count; Pintar }
         'Down'   { $script:Sel = ($script:Sel + 1) % $Filas.Count; Pintar }
@@ -239,7 +247,9 @@ $win.Add_KeyDown({ param($s, $e)
         'Return' { Activar }
         'Space'  { Activar }
         'Escape' { $win.Close() }
+        default  { $h = $false }
     }
+    $e.Handled = $h
 })
 $win.Add_MouseLeftButtonDown({ param($s, $e) if ($e.OriginalSource -is [Windows.Controls.Image] -or $e.OriginalSource -is [Windows.Shapes.Rectangle]) { $win.DragMove() } })
 Pintar
