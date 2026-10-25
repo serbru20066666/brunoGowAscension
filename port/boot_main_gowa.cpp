@@ -2751,7 +2751,27 @@ int main(int argc, char** argv)
      * intercalados, mesma janela). =1 força. */
     { const char* pe = getenv("GOWA_PIN");
       SYSTEM_INFO si; GetSystemInfo(&si);
-      const int pin = pe ? (*pe != '0') : (si.dwNumberOfProcessors >= 12);
+      /* 25/10: nor on a hybrid CPU (performance + efficient cores, e.g. Intel 12th gen
+       * and later): on an i7-14700KF (8 P + 12 E) phase 1 ran at 50.0 fps pinned
+       * (48.2-51.7) and 51.9 / 50.1 not pinned in two sets of runs; the pinning hands
+       * cores out in the order threads become heavy, so one of them lands on an E-core. */
+      int hybrid = 0;
+      { DWORD len = 0; GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+        uint8_t* buf = len ? (uint8_t*)malloc(len) : NULL;
+        if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)buf, &len)) {
+            int emin = 256, emax = -1;
+            for (DWORD off = 0; off < len; ) {
+                const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(buf + off);
+                const int c = e->Processor.EfficiencyClass;
+                if (c < emin) emin = c;
+                if (c > emax) emax = c;
+                off += e->Size;
+            }
+            hybrid = emax > emin;
+        }
+        free(buf); }
+      const int pin = pe ? (*pe != '0') : (si.dwNumberOfProcessors >= 12 && !hybrid);
+      if (hybrid && !pe) fprintf(stderr, "[pin] desligado: CPU hibrida (GOWA_PIN=1 forca)\n");
       { extern int g_gowa_pin_on; g_gowa_pin_on = pin; }   /* desempenho.json */
       if (pin) CreateThread(NULL, 0, gowa_pin_thread, NULL, 0, NULL);
       else if (!pe) fprintf(stderr, "[pin] desligado: %lu CPUs lógicas (fixa só com 12 ou mais; GOWA_PIN=1 força)\n", (unsigned long)si.dwNumberOfProcessors); }
