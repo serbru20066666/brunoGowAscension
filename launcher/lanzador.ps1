@@ -15,6 +15,29 @@ $Vfs = Join-Path $Raiz 'vfs'
 $DirAjustes = Join-Path $env:APPDATA 'GowAscensionLanzador'
 $ArchAjustes = Join-Path $DirAjustes 'ajustes.json'
 
+# ---- resolucion real del monitor principal (el modo actual, sin el escalado de Windows;
+# es la misma que lee el juego con GOWA_FSR y sin GOWA_OUT_W/H) ----------------------
+Add-Type @'
+using System; using System.Runtime.InteropServices;
+public static class ModoPantalla {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+  public struct DEVMODE {
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+    public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra; public int dmFields;
+    public int dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+    public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+    public short dmLogPixels; public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+    public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight; }
+  [DllImport("user32.dll", CharSet = CharSet.Ansi)] static extern bool EnumDisplaySettingsA(string dev, int mode, ref DEVMODE dm);
+  public static int[] Actual() {
+    DEVMODE d = new DEVMODE(); d.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+    if (!EnumDisplaySettingsA(null, -1, ref d)) return new int[] { 0, 0, 0 };
+    return new int[] { d.dmPelsWidth, d.dmPelsHeight, d.dmDisplayFrequency }; } }
+'@
+$Monitor = [ModoPantalla]::Actual()
+$TxtMonitor = if ($Monitor[0]) { "Monitor ($($Monitor[0]) x $($Monitor[1]))" } else { 'Monitor' }
+
 # ---- opciones: clave, etiqueta, valores (texto mostrado, valor), ayuda -------------
 $Opciones = @(
     @{ k = 'res';   t = 'Resolución interna'; v = @(@('720p', '1'), @('1440p (2K)', '2'), @('2160p (4K)', '3'), @('2880p', '4')); d = '2'
@@ -23,8 +46,8 @@ $Opciones = @(
        a = 'Escala la imagen hasta la resolución del monitor con bordes nítidos (AMD FidelityFX Super Resolution 1).' }
     @{ k = 'nit';   t = 'Nitidez FSR'; v = @(@('Alta', '0'), @('Media', '0.2'), @('Suave', '0.5'), @('Mínima', '1.0')); d = '0.2'
        a = 'Cuánto realza los bordes el paso de nitidez (RCAS) del FSR.' }
-    @{ k = 'sal';   t = 'Resolución de salida'; v = @(@('Monitor', 'auto'), @('1920 x 1080', '1920x1080'), @('2560 x 1440', '2560x1440'), @('3840 x 2160', '3840x2160')); d = 'auto'
-       a = 'Tamaño final de la imagen con FSR. "Monitor" usa la resolución actual de tu pantalla.' }
+    @{ k = 'sal';   t = 'Resolución de salida'; v = @(@($TxtMonitor, 'auto'), @('1920 x 1080', '1920x1080'), @('2560 x 1440', '2560x1440'), @('3840 x 2160', '3840x2160')); d = 'auto'
+       a = "Tamaño final de la imagen con FSR. ""Monitor"" se detecta solo: la resolución actual de tu pantalla$(if ($Monitor[0]) { ", $($Monitor[0]) x $($Monitor[1]) a $($Monitor[2]) Hz" })." }
     @{ k = 'pant';  t = 'Modo de pantalla'; v = @(@('Pantalla completa', '1'), @('Ventana', '0')); d = '1'
        a = 'Pantalla completa sin bordes. Durante el juego, Alt+Intro o F11 alternan.' }
     @{ k = 'idi';   t = 'Idioma'; v = @(@('Español', '3'), @('English', '1'), @('Français', '2'), @('Português', '17')); d = '3'
