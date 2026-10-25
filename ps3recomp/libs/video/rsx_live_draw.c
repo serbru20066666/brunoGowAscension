@@ -465,7 +465,7 @@ static void ld_state_dirty(void) { memset(&g_ldc, 0, sizeof g_ldc); }
 enum { LD_VS_DEF = 0, LD_VS_RAW = 1, LD_VS_CONV = 2 };
 /* bytes: the ring space and the view's SizeInBytes; copy: the guest bytes behind it
  * (raw slots), the rest zero-filled */
-typedef struct { u8 kind, swap; u16 fmt; u32 attr, stride, bytes, copy; const u8* src; } ld_vslot;
+typedef struct { u8 kind, swap; u16 fmt; u32 attr, stride, bytes, copy, src_stride; const u8* src; } ld_vslot;
 static ld_vslot g_ld_vs[RSX_DSP_NUM_VERTEX_ATTR];
 static u32 g_ld_vs_n;
 static int g_ld_vs_active;
@@ -7142,7 +7142,7 @@ static int ld_vslots_plan(const rsx_vertex_layout_plan* layout)
         const u32 attr = layout->attrs[slot];
         const rsx_vertex_fetch_attr* f = &dc.fetch_plan.attr[attr];
         ld_vslot* s = &g_ld_vs[slot];
-        s->attr = attr; s->src = NULL; s->swap = 1;
+        s->attr = attr; s->src = NULL; s->swap = 1; s->src_stride = 0;
         if (!f->desc.type || !f->desc.size) {
             s->kind = LD_VS_DEF; s->fmt = (u16)DXGI_FORMAT_R32G32B32A32_FLOAT; s->stride = 0; s->bytes = 16;
             continue;
@@ -7165,6 +7165,18 @@ static int ld_vslots_plan(const rsx_vertex_layout_plan* layout)
              * triangle over the other half). Only the guest's bytes are copied. */
             s->copy = (n - 1) * f->stride + esz;
             s->bytes = n * f->stride;
+            /* D3D12 wants each element aligned to min(4, its size). The game's
+             * snorm16x4 normals and many unorm8x4 attributes sit in strides that
+             * are not a multiple of 4 (e.g. 18, 22): every other vertex started
+             * at a 2-byte boundary and AMD's fetch read shifted bytes -- blotches
+             * on Kratos' skin, the Fury drawn grey and black. Those go up packed,
+             * one element after another (stride = element size), still raw. */
+            const u32 al = esz < 4 ? esz : 4;
+            if (f->stride % al) {
+                s->src_stride = f->stride;
+                s->stride = esz;
+                s->copy = s->bytes = n * esz;
+            }
         } else {
             s->kind = LD_VS_CONV; s->fmt = (u16)DXGI_FORMAT_R32G32B32A32_FLOAT; s->stride = 16; s->bytes = n * 16u;
         }
@@ -7214,7 +7226,16 @@ static int ld_vslots_upload(u32 n)
         u8* dst = dst0 + off;
         if (s->kind == LD_VS_DEF)
             memcpy(dst, dc.fetch_plan.attr[s->attr].default_value, 16);
-        else if (s->kind == LD_VS_RAW) {
+        else if (s->kind == LD_VS_RAW && s->src_stride) {   /* packed: element by element */
+            const u32 esz = s->stride;
+            for (u32 v = 0; v < n; v++) {
+                const u8* a = s->src + (size_t)v * s->src_stride;
+                u8* b = dst + (size_t)v * esz;
+                if (s->swap == 1) memcpy(b, a, esz);
+                else for (u32 i = 0; i < esz; i += s->swap)
+                    for (u32 k = 0; k < s->swap; k++) b[i + k] = a[i + s->swap - 1 - k];
+            }
+        } else if (s->kind == LD_VS_RAW) {
             ld_copy_swap(dst, s->src, s->copy, s->swap);
             if (s->bytes > s->copy) memset(dst + s->copy, 0, s->bytes - s->copy);
         }
@@ -7226,6 +7247,80 @@ static int ld_vslots_upload(u32 n)
         off += ((u64)s->bytes + 15u) & ~15ull;
     }
     return 1;
+}
+
+/* GOWA_VSLOT_CHECK=1: decode each raw slot as the input assembler would read it (the
+ * byte-swapped ring bytes, little endian, in the slot's DXGI format) and compare it
+ * with the per-reference conversion of the compact path. Prints the first mismatches
+ * and, every 512 frames, the raw slots by (type, size) with strides that are not a
+ * multiple of 4. Diagnostic only. */
+static float ld_le_f16(const u8* p)
+{
+    const u16 h = (u16)(p[0] | (p[1] << 8));
+    const u32 sign = (u32)(h >> 15) << 31, exp = (h >> 10) & 0x1F, man = h & 0x3FF;
+    float f;
+    if (exp == 0) { f = (float)man / 16777216.0f; if (sign) f = -f; return f; }
+    const u32 out = exp == 31 ? (sign | 0x7F800000u | (man << 13)) : (sign | ((exp + 112) << 23) | (man << 13));
+    memcpy(&f, &out, 4);
+    return f;
+}
+static void ld_vslot_check(u32 n)
+{
+    static int on = -1, bad_lines = 0;
+    static u32 frame0 = 0xFFFFFFFFu, nf;
+    static unsigned long long n_raw[8][5], n_odd[8][5], n_bad[8][5];
+    if (on < 0) on = getenv("GOWA_VSLOT_CHECK") ? 1 : 0;
+    if (!on) return;
+    if (frame0 != g_ld_frames) {
+        frame0 = g_ld_frames;
+        if (++nf % 512 == 0) {
+            fprintf(stderr, "[vslotchk] 512 quadros, slots crus por tipo/tam (total / stride%%4!=0 / com diferenca):");
+            for (int t = 0; t < 8; t++) for (int s = 0; s < 5; s++)
+                if (n_raw[t][s]) fprintf(stderr, " t%d s%d: %llu/%llu/%llu", t, s, n_raw[t][s], n_odd[t][s], n_bad[t][s]);
+            fprintf(stderr, "\n");
+            memset(n_raw, 0, sizeof n_raw); memset(n_odd, 0, sizeof n_odd); memset(n_bad, 0, sizeof n_bad);
+        }
+    }
+    const u8* const dst0 = g.vb_mapped + g.vb_used;
+    u64 off = 0;
+    static float* conv; static u32 conv_cap;
+    if (n > conv_cap) { free(conv); conv_cap = n * 2; conv = (float*)malloc((size_t)conv_cap * 16); if (!conv) { conv_cap = 0; return; } }
+    for (u32 si = 0; si < g_ld_vs_n; si++) {
+        const ld_vslot* s = &g_ld_vs[si];
+        const u8* dst = dst0 + off;
+        off += ((u64)s->bytes + 15u) & ~15ull;
+        if (s->kind != LD_VS_RAW) continue;
+        const rsx_vertex_fetch_attr* f = &dc.fetch_plan.attr[s->attr];
+        const u32 t = f->desc.type & 7u, sz = f->desc.size < 5 ? f->desc.size : 4;
+        n_raw[t][sz]++;
+        if (s->stride % 4u) n_odd[t][sz]++;
+        if (!rsx_vertex_fetch_attr_all(&dc.fetch_plan, s->attr, dc.refs, n, (u8*)conv, 16u)) continue;
+        int bad = 0;
+        for (u32 v = 0; v < n && !bad; v++) {
+            const u8* e = dst + (size_t)v * s->stride;
+            for (u32 c = 0; c < sz && !bad; c++) {
+                float got;
+                switch (t) {
+                case RSX_VTX_TYPE_FLOAT: memcpy(&got, e + c * 4, 4); break;
+                case RSX_VTX_TYPE_HALF: got = ld_le_f16(e + c * 2); break;
+                case RSX_VTX_TYPE_SNORM16: { s16 q; memcpy(&q, e + c * 2, 2); got = q < -32767 ? -1.0f : q / 32767.0f; break; }
+                case RSX_VTX_TYPE_UNORM8: got = e[c] / 255.0f; break;
+                default: got = conv[v * 4 + c]; break;
+                }
+                const float want = conv[v * 4 + c];
+                const float d = got - want;
+                if (!(d < 1e-3f && d > -1e-3f) && !(got != got && want != want)) {
+                    bad = 1;
+                    if (bad_lines < 40) {
+                        bad_lines++;
+                        fprintf(stderr, "[vslotchk] frame %u slot %u attr %u type %u size %u stride %u fmt %u vert %u/%u comp %u: ia=%g conv=%g\n",
+                                g_ld_frames, si, s->attr, t, sz, s->stride, (unsigned)s->fmt, v, n, c, got, want);
+                    }
+                }
+            }
+        }
+        if (bad) n_bad[t][sz]++;
+    }
 }
 
 static void dc_reset(void)
@@ -9693,6 +9788,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                   fprintf(stderr, "\n");
               }
           } }
+        ld_vslot_check(dc.n_verts);
     } else if (draw_vb_bytes)
         memcpy(
             g.vb_mapped + g.vb_used, vertex_data,
