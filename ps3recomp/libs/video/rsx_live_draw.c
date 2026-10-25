@@ -463,7 +463,9 @@ static void ld_state_dirty(void) { memset(&g_ldc, 0, sizeof g_ldc); }
 /* GOWA (24/10): the per-slot vertex upload of the draw being recorded (ld_vslots_plan,
  * after draw_ctx): one vertex buffer per layout slot; build_pso/get_pso read the formats */
 enum { LD_VS_DEF = 0, LD_VS_RAW = 1, LD_VS_CONV = 2 };
-typedef struct { u8 kind, swap; u16 fmt; u32 attr, stride, bytes; const u8* src; } ld_vslot;
+/* bytes: the ring space and the view's SizeInBytes; copy: the guest bytes behind it
+ * (raw slots), the rest zero-filled */
+typedef struct { u8 kind, swap; u16 fmt; u32 attr, stride, bytes, copy; const u8* src; } ld_vslot;
 static ld_vslot g_ld_vs[RSX_DSP_NUM_VERTEX_ATTR];
 static u32 g_ld_vs_n;
 static int g_ld_vs_active;
@@ -2036,7 +2038,10 @@ static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
         b->BlendOpAlpha  = gcm_blend_op(rs->eq_a);
     }
     pd->RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    if (rs->cull_enable && rs->cull_face) {
+    /* LD_NO_CULL=1: no face culling on any draw (a probe for missing triangles). */
+    static int no_cull = -1;
+    if (no_cull < 0) { const char* e = getenv("LD_NO_CULL"); no_cull = (e && e[0] == '1') ? 1 : 0; }
+    if (rs->cull_enable && rs->cull_face && !no_cull) {
         const u32 f = rs->cull_face;
         pd->RasterizerState.CullMode = (f == 0x0404) ? D3D12_CULL_MODE_FRONT
                                      : (f == 0x0405) ? D3D12_CULL_MODE_BACK
@@ -7152,7 +7157,14 @@ static int ld_vslots_plan(const rsx_vertex_layout_plan* layout)
             (u64)e0 + n - 1 <= 0x000FFFFFu) {
             s->kind = LD_VS_RAW; s->fmt = fmt; s->swap = sw; s->stride = f->stride;
             s->src = f->stable_base + (u64)(e0 - f->stable_first) * f->stride;
-            s->bytes = (n - 1) * f->stride + esz;
+            /* The view covers n whole strides. AMD's input assembler counts the
+             * vertices in a view as SizeInBytes / stride: with (n-1)*stride+esz
+             * (a 12-byte position in a 16-byte stride) the last vertex read as
+             * out of range, i.e. zero -- the second triangle of every quad
+             * collapsed (the opening movie drawn as half a rectangle, a black
+             * triangle over the other half). Only the guest's bytes are copied. */
+            s->copy = (n - 1) * f->stride + esz;
+            s->bytes = n * f->stride;
         } else {
             s->kind = LD_VS_CONV; s->fmt = (u16)DXGI_FORMAT_R32G32B32A32_FLOAT; s->stride = 16; s->bytes = n * 16u;
         }
@@ -7202,8 +7214,10 @@ static int ld_vslots_upload(u32 n)
         u8* dst = dst0 + off;
         if (s->kind == LD_VS_DEF)
             memcpy(dst, dc.fetch_plan.attr[s->attr].default_value, 16);
-        else if (s->kind == LD_VS_RAW)
-            ld_copy_swap(dst, s->src, s->bytes, s->swap);
+        else if (s->kind == LD_VS_RAW) {
+            ld_copy_swap(dst, s->src, s->copy, s->swap);
+            if (s->bytes > s->copy) memset(dst + s->copy, 0, s->bytes - s->copy);
+        }
         else if (!rsx_vertex_fetch_attr_all(&dc.fetch_plan, s->attr, dc.refs, n, dst, 16u))
             return 0;
         g_ld_vs_view[si].BufferLocation = va + off;
@@ -9642,6 +9656,43 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             g_ld_stats.group_drop_fetch++;
             return;
         }
+        /* GOWA_VSLOT_DBG=<frame>: from that frame, for slot draws of at most 6 index
+         * references (quads), print the indices and each slot next to what the
+         * per-reference fetch (the compact path) gives for the same vertices. */
+        { static int vd = -2, vn = 0; if (vd == -2) { const char* e = getenv("GOWA_VSLOT_DBG"); vd = e ? atoi(e) : -1; }
+          if (vd >= 0 && (int)g_ld_frames >= vd && dc.n_source_refs <= 6 && vn < 24) {
+              vn++;
+              fprintf(stderr, "[vslotdbg] frame %u refs=%u src=%u idx_fast=%d dense=%d slots=%u idx:", g_ld_frames,
+                      dc.n_refs, dc.n_source_refs, dc.idx_fast, g_rsx_remap_dense, g_ld_vs_n);
+              u32 tmp_idx[6];
+              write_topology_indices(prim, tmp_idx);
+              for (u32 i = 0; i < dc.n_source_refs && i < 6; i++) fprintf(stderr, " %u", tmp_idx[i]);
+              fprintf(stderr, " refs:");
+              for (u32 i = 0; i < dc.n_refs && i < 6; i++) fprintf(stderr, " %u+%u", dc.refs[i].vertex_id, dc.refs[i].base_index);
+              fprintf(stderr, "\n");
+              float conv[6 * 4];
+              for (u32 si = 0; si < g_ld_vs_n; si++) {
+                  const ld_vslot* s = &g_ld_vs[si];
+                  const rsx_vertex_fetch_attr* f = &dc.fetch_plan.attr[s->attr];
+                  fprintf(stderr, "[vslotdbg]   slot %u attr %u kind %d fmt %u stride %u bytes %u type %u size %u first %u:",
+                          si, s->attr, (int)s->kind, (unsigned)s->fmt, s->stride, s->bytes, f->desc.type, f->desc.size,
+                          (unsigned)f->stable_first);
+                  const u32 nv = dc.n_refs < 6 ? dc.n_refs : 6;
+                  int ok = rsx_vertex_fetch_attr_all(&dc.fetch_plan, s->attr, dc.refs, nv, (u8*)conv, 16u);
+                  for (u32 v = 0; v < nv; v++)
+                      fprintf(stderr, " [%g %g %g %g]", ok ? conv[v*4] : -1.0f, ok ? conv[v*4+1] : -1.0f,
+                              ok ? conv[v*4+2] : -1.0f, ok ? conv[v*4+3] : -1.0f);
+                  if (s->kind == LD_VS_RAW && s->swap == 4) {
+                      fprintf(stderr, " raw:");
+                      for (u32 v = 0; v < nv; v++) {
+                          fprintf(stderr, " [");
+                          for (u32 c = 0; c < f->desc.size; c++) fprintf(stderr, "%s%g", c ? " " : "", ld_be_f32(s->src + (size_t)v * s->stride + c * 4));
+                          fprintf(stderr, "]");
+                      }
+                  }
+                  fprintf(stderr, "\n");
+              }
+          } }
     } else if (draw_vb_bytes)
         memcpy(
             g.vb_mapped + g.vb_used, vertex_data,
