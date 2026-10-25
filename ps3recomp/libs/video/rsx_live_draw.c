@@ -828,7 +828,18 @@ static void ld_osd_desenha(void)
     s_osd_alloc_fence[ai] = v;
     ReleaseSRWLockExclusive(&s_osd_lock);
 }
+/* GOWA (25/10): Present runs on the RSX thread, the movie thread and (GOWA_FG_ASYNC)
+ * the frame generation thread; one at a time, with the backbuffer it fills. */
+static SRWLOCK s_present_lock = SRWLOCK_INIT;
+static HRESULT ld_swap_present_locked(void);
 static HRESULT ld_swap_present(void)
+{
+    AcquireSRWLockExclusive(&s_present_lock);
+    const HRESULT hr = ld_swap_present_locked();
+    ReleaseSRWLockExclusive(&s_present_lock);
+    return hr;
+}
+static HRESULT ld_swap_present_locked(void)
 {
     ld_osd_desenha();
     LARGE_INTEGER a, b; QueryPerformanceCounter(&a);
@@ -13299,6 +13310,22 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
 #define FG_MW (FG_LW / FG_B)
 #define FG_MH (FG_LH / FG_B)
 #define FG_READ (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+/* GOWA_FG_ASYNC (default 1, =0 the old way): the RSX thread only draws the middle
+ * frame into s_fgm[k] and hands the pair over; a thread of its own presents the
+ * middle frame, sleeps half a guest interval and presents the real one. Before,
+ * the RSX thread did both presents and woke every 200 us waiting for the second
+ * (RSX-present 50% -> 87% of a core, the game 58 -> 33-45 FPS). */
+static ID3D12Resource* s_fgm[2];
+static ID3D12DescriptorHeap* s_fgm_rtv;
+static SRWLOCK s_fg_lock = SRWLOCK_INIT;      /* the job, and submissions touching fg[]/s_fgm[] */
+static HANDLE s_fg_job_ev;
+static struct { LONG gen; int k, interp; LONGLONG due; } s_fg_job;
+static int ld_fg_async_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GOWA_FG_ASYNC"); on = !(e && e[0] == '0'); }
+    return on;
+}
 static struct {
     int on;
     int failed;
@@ -13539,6 +13566,19 @@ static int ld_fg_resources(u32 w, u32 h)
     if (!s_fg.mv) return 0;
     g.dev->lpVtbl->CreateShaderResourceView(g.dev, s_fg.mv, NULL, ld_fg_cpu(s_fg.heap, s_fg.step, 4u));
     g.dev->lpVtbl->CreateUnorderedAccessView(g.dev, s_fg.mv, NULL, NULL, ld_fg_cpu(s_fg.heap, s_fg.step, 7u));
+    /* GOWA_FG_ASYNC: the middle frames, one per fg[k], drawn by the RSX thread and
+     * presented by the frame generation thread */
+    if (!s_fgm_rtv) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 2; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        if (FAILED(g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_fgm_rtv))) return 0;
+    }
+    for (int i = 0; i < 2; i++) {
+        if (s_fgm[i]) { retire_texture(s_fgm[i]); s_fgm[i] = NULL; }
+        s_fgm[i] = ld_fg_tex(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, FG_READ);
+        if (!s_fgm[i]) return 0;
+        g.dev->lpVtbl->CreateRenderTargetView(g.dev, s_fgm[i], NULL, ld_fg_cpu(s_fgm_rtv, s_fg.rtv_step, (u32)i));
+    }
     s_fg.w = w; s_fg.h = h; s_fg.have_prev = 0; s_fg.pending = 0;
     fprintf(stderr, "[framegen] recursos %ux%u\n", w, h);
     return 1;
@@ -13588,11 +13628,10 @@ static void ld_fg_motion(int cur, int prev)
     ld_fg_barrier(s_fg.mv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, FG_READ);
 }
 /* the middle frame of fg[prev] and fg[cur] into backbuffer bbi (RENDER_TARGET) */
-static void ld_fg_interp(int prev, int cur, u32 bbi)
+static void ld_fg_interp(int prev, int cur, ID3D12Resource* dst, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
 {
     D3D12_RESOURCE_DESC bd;
-    g.backbuf[bbi]->lpVtbl->GetDesc(g.backbuf[bbi], &bd);
-    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(bbi);
+    dst->lpVtbl->GetDesc(dst, &bd);
     g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
     D3D12_VIEWPORT vp = {0, 0, (float)bd.Width, (float)bd.Height, 0.0f, 1.0f};
     D3D12_RECT sc = {0, 0, (LONG)bd.Width, (LONG)bd.Height};
@@ -13632,7 +13671,14 @@ static void ld_fg_barrier_on(ID3D12GraphicsCommandList* l, ID3D12Resource* r, D3
 /* the real frame fg[cur] to the screen, through s_fg.list. Everything that
  * produced fg[cur] was submitted before (with the middle frame), and the
  * queue keeps the order. */
-static void ld_fg_present_real(void)
+static int ld_fg_show(ID3D12Resource* src, int real, LONG gen);
+static void ld_fg_present_real(void) { ld_fg_show(s_fg.fg[s_fg.cur], 1, 0); }
+/* `src` (FG_READ, backbuffer size) to the screen through s_fg.list, and Present.
+ * Everything that produced it was submitted before, and the queue keeps the order.
+ * gen != 0 (GOWA_FG_ASYNC): dropped, returning 0, when the RSX thread has moved on
+ * (a middle frame: any newer job; a real one: two newer, its buffer being rewritten);
+ * the check and the submission are under s_fg_lock, the Present is not. */
+static int ld_fg_show(ID3D12Resource* src, int real, LONG gen)
 {
     if (!s_fg.list) {
         int ok = 1;
@@ -13641,7 +13687,7 @@ static void ld_fg_present_real(void)
                                &IID_ID3D12CommandAllocator, (void**)&s_fg.alloc[i]));
         if (ok) ok = SUCCEEDED(g.dev->lpVtbl->CreateCommandList(g.dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_fg.alloc[0],
                                    NULL, &IID_ID3D12GraphicsCommandList, (void**)&s_fg.list));
-        if (!ok) { s_fg.list = NULL; s_fg.pending = 0; return; }
+        if (!ok) { s_fg.list = NULL; s_fg.pending = 0; return 0; }
         s_fg.list->lpVtbl->Close(s_fg.list);
     }
     /* GOWA (25/10): own fence, value and event -- this runs on the present thread
@@ -13650,7 +13696,7 @@ static void ld_fg_present_real(void)
     static ID3D12Fence* s_fgf; static u64 s_fgv; static HANDLE s_fge;
     if (!s_fgf) {
         if (FAILED(g.dev->lpVtbl->CreateFence(g.dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&s_fgf)))
-            { s_fgf = NULL; s_fg.pending = 0; return; }
+            { s_fgf = NULL; s_fg.pending = 0; return 0; }
         s_fge = CreateEventA(NULL, FALSE, FALSE, NULL);
     }
     const u32 ai = s_fg.ai; s_fg.ai = (ai + 1u) % 3u;
@@ -13660,23 +13706,88 @@ static void ld_fg_present_real(void)
     s_fg.alloc[ai]->lpVtbl->Reset(s_fg.alloc[ai]);
     ID3D12GraphicsCommandList* l = s_fg.list;
     l->lpVtbl->Reset(l, s_fg.alloc[ai], NULL);
+    AcquireSRWLockExclusive(&s_present_lock);   /* the index, the copy and the Present together */
     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
     ID3D12Resource* bb = g.backbuf[bbi];
-    ld_fg_barrier_on(l, s_fg.fg[s_fg.cur], FG_READ, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ld_fg_barrier_on(l, src, FG_READ, D3D12_RESOURCE_STATE_COPY_SOURCE);
     ld_fg_barrier_on(l, bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
-    l->lpVtbl->CopyResource(l, bb, s_fg.fg[s_fg.cur]);
+    l->lpVtbl->CopyResource(l, bb, src);
     ld_fg_barrier_on(l, bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
-    ld_fg_barrier_on(l, s_fg.fg[s_fg.cur], D3D12_RESOURCE_STATE_COPY_SOURCE, FG_READ);
+    ld_fg_barrier_on(l, src, D3D12_RESOURCE_STATE_COPY_SOURCE, FG_READ);
     l->lpVtbl->Close(l);
     ID3D12CommandList* lists[] = {(ID3D12CommandList*)l};
-    g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
-    const u64 v = ++s_fgv;
-    g.queue->lpVtbl->Signal(g.queue, s_fgf, v);
-    s_fg.alloc_fence[ai] = v;
-    if (g.ready) ld_swap_present();
-    s_fg.pending = 0;
-    s_fg.n_real++;
+    int stale = 0;
+    if (gen) {
+        AcquireSRWLockShared(&s_fg_lock);
+        stale = real ? (s_fg_job.gen - gen > 1) : (s_fg_job.gen != gen);
+        if (!stale) g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+        ReleaseSRWLockShared(&s_fg_lock);
+    } else
+        g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+    if (!stale) {
+        const u64 v = ++s_fgv;
+        g.queue->lpVtbl->Signal(g.queue, s_fgf, v);
+        s_fg.alloc_fence[ai] = v;
+        if (g.ready) ld_swap_present_locked();
+    }
+    ReleaseSRWLockExclusive(&s_present_lock);
+    if (stale) return 0;
+    if (real) { s_fg.pending = 0; s_fg.n_real++; } else s_fg.n_interp++;
     ld_fg_log();
+    return 1;
+}
+/* GOWA_FG_ASYNC: the frame generation thread. Per job: the middle frame now, the
+ * real one half a guest interval later (sooner if the next job comes first). A job
+ * whose buffers the RSX thread is already overwriting (two newer jobs) is dropped;
+ * the check and the submission are under s_fg_lock, which the RSX thread holds
+ * while it submits a frame's fg[]/s_fgm[] work, so the queue order is safe. */
+static DWORD WINAPI ld_fg_thread(LPVOID arg)
+{
+    (void)arg;
+    LONG done = 0;
+    for (;;) {
+        WaitForSingleObject(s_fg_job_ev, 100);
+        AcquireSRWLockShared(&s_fg_lock);
+        const LONG gen = s_fg_job.gen; const int k = s_fg_job.k, interp = s_fg_job.interp;
+        const LONGLONG due = s_fg_job.due;
+        ReleaseSRWLockShared(&s_fg_lock);
+        if (gen == done || !g.ready) continue;
+        done = gen;
+        if (interp) {
+            if (!ld_fg_show(s_fgm[k], 0, gen)) continue;   /* a newer job is waiting */
+            /* sleep until due; a new job wakes us and the real frame goes at once */
+            const LONGLONG now = ld_fg_now();
+            if (due > now) {
+                const DWORD ms = (DWORD)((due - now) * 1000 / s_fg.freq);
+                static HANDLE t = NULL;
+                if (!t) t = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+                if (t) {
+                    LARGE_INTEGER d; d.QuadPart = -(LONGLONG)((due - now) * 10000000 / s_fg.freq);
+                    SetWaitableTimer(t, &d, 0, NULL, NULL, FALSE);
+                    HANDLE hs[2] = { t, s_fg_job_ev };
+                    if (WaitForMultipleObjects(2, hs, FALSE, ms + 5) == WAIT_OBJECT_0 + 1) SetEvent(s_fg_job_ev);
+                } else Sleep(ms);
+            }
+        }
+        ld_fg_show(s_fg.fg[k], 1, gen);
+    }
+}
+/* the RSX thread: submit the frame's work and hand the pair over */
+static void ld_fg_publish(int k, int interp, LONGLONG due)
+{
+    static int started;
+    if (!started) {
+        started = 1;
+        s_fg_job_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+        HANDLE th = CreateThread(NULL, 0, ld_fg_thread, NULL, 0, NULL);
+        if (th) { SetThreadDescription(th, L"FG-present"); SetThreadPriority(th, THREAD_PRIORITY_ABOVE_NORMAL); CloseHandle(th); }
+        fprintf(stderr, "[framegen] hilo de presentacion propio (GOWA_FG_ASYNC)\n");
+    }
+    AcquireSRWLockExclusive(&s_fg_lock);
+    ld_flush(LD_FLUSH_PRESENT);
+    s_fg_job.k = k; s_fg_job.interp = interp; s_fg_job.due = due; s_fg_job.gen++;
+    ReleaseSRWLockExclusive(&s_fg_lock);
+    SetEvent(s_fg_job_ev);
 }
 /* A guest frame (surface `src`, in RENDER_TARGET, SRV slot src_srv of the main
  * heap) through frame generation. 0: not handled (caller presents it). */
@@ -13686,7 +13797,8 @@ static int ld_fg_present_guest(ID3D12Resource* src, u32 src_srv)
     D3D12_RESOURCE_DESC bd;
     g.backbuf[0]->lpVtbl->GetDesc(g.backbuf[0], &bd);
     if (!ld_fg_resources((u32)bd.Width, bd.Height)) return 0;
-    if (s_fg.pending) ld_fg_present_real();
+    const int async = ld_fg_async_on();
+    if (s_fg.pending && !async) ld_fg_present_real();
     const LONGLONG now = ld_fg_now();
     const int k = s_fg.have_prev ? (s_fg.cur ^ 1) : s_fg.cur;
     /* 1. the guest surface into fg[k] */
@@ -13725,12 +13837,22 @@ static int ld_fg_present_guest(ID3D12Resource* src, u32 src_srv)
     const int interp = s_fg.have_prev && dt > 0 && dt < s_fg.freq * 60 / 1000;
     s_fg.cur = k;
     s_fg.have_prev = 1;
+    if (async) {   /* GOWA_FG_ASYNC: draw the middle frame into s_fgm[k] and hand over */
+        if (interp) {
+            ld_fg_motion(k, k ^ 1);
+            ld_fg_barrier(s_fgm[k], FG_READ, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            ld_fg_interp(k ^ 1, k, s_fgm[k], ld_fg_cpu(s_fgm_rtv, s_fg.rtv_step, (u32)k));
+            ld_fg_barrier(s_fgm[k], D3D12_RESOURCE_STATE_RENDER_TARGET, FG_READ);
+        }
+        ld_fg_publish(k, interp, now + dt / 2);
+        return 1;
+    }
     if (!interp) { ld_flush(LD_FLUSH_PRESENT); ld_fg_present_real(); return 1; }   /* fg[k] submitted first */
     /* 3. motion and the middle frame, presented now */
     ld_fg_motion(k, k ^ 1);
     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
     ld_fg_barrier(g.backbuf[bbi], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    ld_fg_interp(k ^ 1, k, bbi);
+    ld_fg_interp(k ^ 1, k, g.backbuf[bbi], rtv_handle(bbi));
     ld_fg_barrier(g.backbuf[bbi], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     ld_flush(LD_FLUSH_PRESENT);
     if (g.ready) ld_swap_present();
