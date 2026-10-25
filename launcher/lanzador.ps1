@@ -40,14 +40,12 @@ $TxtMonitor = if ($Monitor[0]) { "Monitor ($($Monitor[0]) x $($Monitor[1]))" } e
 
 # ---- opciones: clave, etiqueta, valores (texto mostrado, valor), ayuda -------------
 $Opciones = @(
-    @{ k = 'res';   t = 'Resolución interna'; v = @(@('720p', '1'), @('1440p (2K)', '2'), @('2160p (4K)', '3'), @('2880p', '4')); d = '2'
-       a = 'A qué resolución dibuja el juego. Más alta = más nítido y más trabajo para la GPU.' }
+    @{ k = 'res';   t = 'Resolución de renderizado'; v = @(@('720p', '1'), @('1440p (2K)', '2'), @('2160p (4K)', '3'), @('2880p', '4')); d = '2'
+       a = 'A qué resolución dibuja el juego. Más alta = más nítido y más trabajo para la GPU. La ventana se puede poner de cualquier tamaño; Alt+Intro o F11 pasan a pantalla completa.' }
     @{ k = 'fsr';   t = 'Escalado FSR 1'; v = @(@('Sí', '1'), @('No', '0')); d = '1'
-       a = 'Escala la imagen hasta la resolución del monitor con bordes nítidos (AMD FidelityFX Super Resolution 1).' }
+       a = "Escala la imagen hasta la resolución de tu monitor, $(if ($Monitor[0]) { "$($Monitor[0]) x $($Monitor[1]) (detectada), " })con bordes nítidos (AMD FidelityFX Super Resolution 1). Si la resolución de renderizado ya es la del monitor, no hace nada." }
     @{ k = 'nit';   t = 'Nitidez FSR'; v = @(@('Alta', '0'), @('Media', '0.2'), @('Suave', '0.5'), @('Mínima', '1.0')); d = '0.2'
        a = 'Cuánto realza los bordes el paso de nitidez (RCAS) del FSR.' }
-    @{ k = 'sal';   t = 'Resolución de salida'; v = @(@($TxtMonitor, 'auto'), @('1920 x 1080', '1920x1080'), @('2560 x 1440', '2560x1440'), @('3840 x 2160', '3840x2160')); d = 'auto'
-       a = "Tamaño final de la imagen con FSR. ""Monitor"" se detecta solo: la resolución actual de tu pantalla$(if ($Monitor[0]) { ", $($Monitor[0]) x $($Monitor[1]) a $($Monitor[2]) Hz" })." }
     @{ k = 'pant';  t = 'Modo de pantalla'; v = @(@('Pantalla completa', '1'), @('Ventana', '0')); d = '1'
        a = 'Pantalla completa sin bordes. Durante el juego, Alt+Intro o F11 alternan.' }
     @{ k = 'idi';   t = 'Idioma'; v = @(@('Español', '3'), @('English', '1'), @('Français', '2'), @('Português', '17')); d = '3'
@@ -204,7 +202,7 @@ function Pintar {
             $f.Valor.Text = $(if ($on) { '◀  ' + (Texto-Valor $f.Opcion) + '  ▶' } else { Texto-Valor $f.Opcion })
             $f.Valor.Foreground = $(if ($on) { $oro } else { $pergamino })
             # opciones de FSR atenuadas si el FSR esta apagado
-            if ($f.Opcion.k -in 'nit', 'sal' -and $Ajustes['fsr'] -eq '0' -and -not $on) { $f.Etiqueta.Foreground = $tenue; $f.Valor.Foreground = $tenue }
+            if ($f.Opcion.k -eq 'nit' -and $Ajustes['fsr'] -eq '0' -and -not $on) { $f.Etiqueta.Foreground = $tenue; $f.Valor.Foreground = $tenue }
         }
     }
     $f = $Filas[$script:Sel]
@@ -240,7 +238,6 @@ function Activar {
         GOWA_FRAMEGEN = $Ajustes['fg']; GOWA_PRESENT_SYNC = $Ajustes['vs']; GOWA_OSD = $Ajustes['osd']
         GOWA_AUDIO_MUTE = $Ajustes['son']
     }
-    if ($Ajustes['sal'] -ne 'auto') { $wh = $Ajustes['sal'] -split 'x'; $e['GOWA_OUT_W'] = $wh[0]; $e['GOWA_OUT_H'] = $wh[1] }
     New-Item -ItemType Directory -Force $e.PS3_SAVE_ROOT, (Join-Path $Raiz 'out') | Out-Null
     foreach ($k in $e.Keys) { [Environment]::SetEnvironmentVariable($k, [string]$e[$k], 'Process') }
     $log = Join-Path $Raiz 'out\jogo.log'
