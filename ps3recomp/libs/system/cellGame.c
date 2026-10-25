@@ -295,6 +295,17 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
         printf("[cellGame] PARAM.SFO not read ('%s'); keeping title id '%s'\n",
                sfo_path, s_title_id);
     }
+    /* PS3_TITLE_ID=<id>: the title id the game sees, whatever the disc's SFO says.
+     * A port built on one region's executable (and its update) can then run on
+     * another region's disc data: the update and the saves live under this id. */
+    {
+        const char* e = getenv("PS3_TITLE_ID");
+        if (e && e[0] && strcmp(e, s_title_id) != 0) {
+            printf("[cellGame] title id '%s' replaced by PS3_TITLE_ID '%s'\n", s_title_id, e);
+            strncpy(s_title_id, e, sizeof(s_title_id) - 1);
+            s_title_id[sizeof(s_title_id) - 1] = '\0';
+        }
+    }
     if (sfo_read_string(sfo_path, "TITLE", tmp, sizeof(tmp)) == 0 && tmp[0]) {
         strncpy(s_title, tmp, sizeof(s_title) - 1); s_title[sizeof(s_title) - 1] = '\0';
     }

@@ -2562,6 +2562,13 @@ int main(int argc, char** argv)
      *  FIOS (func_002C31E8 testa o bit 0x1 dos attributes). */
     if (!GetEnvironmentVariableA("PS3_BOOT_PATCH", NULL, 0))
         SetEnvironmentVariableA("PS3_BOOT_PATCH", "1");
+    /*  PS3_TITLE_ID=BCUS98232 -- o executável é sempre o do update 1.04 americano,
+     *  então o update (PATCHES, TPPS.PSARC) e os saves ficam sob BCUS98232 mesmo
+     *  com os dados de um disco europeu (BCES01741), cujo PARAM.SFO daria outro
+     *  título: sem isso o update não era achado e o jogo parava em "waiting for
+     *  network layer to be connected". */
+    if (!GetEnvironmentVariableA("PS3_TITLE_ID", NULL, 0))
+        SetEnvironmentVariableA("PS3_TITLE_ID", "BCUS98232");
     if (!GetEnvironmentVariableA("PS3_HDD0_ROOT", NULL, 0)) {
         char vroot[1024];
         DWORD n = GetEnvironmentVariableA("PS3_VFS_ROOT", vroot, sizeof vroot);

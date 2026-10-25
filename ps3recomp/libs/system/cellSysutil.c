@@ -268,9 +268,14 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
 
     s32 v = 0;
     switch (id) {
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
-        v = CELL_SYSUTIL_LANG_ENGLISH_US;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG: {
+        /* GOWA_LANG=<n>: the console language as a CELL_SYSUTIL_LANG_* number
+         * (1 English US, 2 French, 3 Spanish, 17 Portuguese BR...); Spanish if unset. */
+        const char* e = getenv("GOWA_LANG");
+        v = (e && *e >= '0' && *e <= '9') ? atoi(e) : CELL_SYSUTIL_LANG_SPANISH;
+        if (v < 0 || v > 19) v = CELL_SYSUTIL_LANG_SPANISH;
         break;
+    }
     case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
         v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
         break;

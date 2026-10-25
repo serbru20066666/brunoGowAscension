@@ -144,6 +144,7 @@ static u64            s_audio_start_us = 0;
 
 /* Mixing thread */
 static unsigned long long g_audio_dropped;   /* frames the device had no room for */
+static unsigned long long g_audio_starved;   /* submits that found the device buffer empty */
 static volatile int  s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
 #ifndef _WIN32
@@ -394,6 +395,8 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 
     UINT32 padding = 0;
     s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    /* the device played everything it had: an audible gap (AUDIO_RATE counts them) */
+    { static int started = 0; if (padding == 0 && started) g_audio_starved++; started = 1; }
 
     UINT32 available = s_wasapi_buf_frames - padding;
     if (num_samples > available) {
@@ -676,19 +679,24 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
-          if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0;
+          if (on) { static ULONGLONG t0; static unsigned n, z, holes, run; static int prev_sound;
+            static unsigned long long d0, s0;
             ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
+            /* holes: 1-4 silent blocks between blocks with sound -- the guest
+             * mixer did not write the block in time (a gap you can hear). */
             { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * s_out_ch; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
-              if (!nz) z++; }
+              if (!nz) { z++; run++; }
+              else { if (prev_sound && run > 0 && run <= 4) holes++; run = 0; prev_sound = 1; } }
             if (now - t0 >= 5000) {
-                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",
-                        n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, holes %u, starved %llu, dropped %.0f frames/s, device buf %u%c",
+                        n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, holes, g_audio_starved - s0,
+                        (g_audio_dropped - d0) * 1000.0 / (now - t0),
                 #if AUDIO_BACKEND_WASAPI
                         (unsigned)s_wasapi_buf_frames, 10);
 #else
                         0u, 10);
 #endif
-                n = z = 0; d0 = g_audio_dropped; t0 = now; } } }
+                n = z = holes = 0; d0 = g_audio_dropped; s0 = g_audio_starved; t0 = now; } } }
 
         /* Notify event queues */
         audio_notify_event_queues();
