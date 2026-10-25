@@ -55,6 +55,7 @@ static int s_present_suppressed = 0;
 
 static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (rsx_fullscreen_key(hwnd, msg, wp, lp)) return 0;
     switch (msg) {
     case WM_CLOSE:
         s_state.window_closed = 1;

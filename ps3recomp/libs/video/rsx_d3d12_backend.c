@@ -493,6 +493,7 @@ static u32    s_lock_n  = 0;
 
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (rsx_fullscreen_key(hwnd, msg, wp, lp)) return 0;
     switch (msg) {
     case WM_CLOSE:
         s_d3d.window_closed = 1;

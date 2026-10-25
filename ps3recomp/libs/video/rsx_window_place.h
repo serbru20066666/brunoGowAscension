@@ -53,5 +53,44 @@ static HWND rsx_create_placed_window(const char* cls, const char* title, unsigne
     if (hwnd && other) ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     return hwnd;
 }
+
+/* Borderless full screen on the window's monitor, and back (Alt+Enter, F11).
+ * DXGI's own Alt+Enter (exclusive full screen) is turned off on the swap chains
+ * (DXGI_MWA_NO_ALT_ENTER): it changed the display mode without the swap chain
+ * being resized and the picture froze. A borderless window needs no resize:
+ * the presenter stretches its buffers to the client area. */
+static void rsx_toggle_borderless(HWND hwnd)
+{
+    static WINDOWPLACEMENT prev = { sizeof(WINDOWPLACEMENT) };
+    const LONG_PTR style = GetWindowLongPtrA(hwnd, GWL_STYLE);
+    if (style & WS_OVERLAPPEDWINDOW) {
+        MONITORINFO mi; mi.cbSize = sizeof mi;
+        if (GetWindowPlacement(hwnd, &prev) &&
+            GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            SetWindowLongPtrA(hwnd, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+            SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        }
+    } else {
+        SetWindowLongPtrA(hwnd, GWL_STYLE, (style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(hwnd, &prev);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
+}
+
+/* For the window procedures: 1 when the message was Alt+Enter or F11 (handled). */
+static int rsx_fullscreen_key(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if ((msg == WM_SYSKEYDOWN && wp == VK_RETURN && (lp & (1 << 29)) && !(lp & (1 << 30))) ||
+        (msg == WM_KEYDOWN && wp == VK_F11 && !(lp & (1 << 30)))) {
+        rsx_toggle_borderless(hwnd);
+        return 1;
+    }
+    /* no system beep for Alt+Enter */
+    if (msg == WM_SYSCHAR && wp == VK_RETURN) return 1;
+    return 0;
+}
 #endif
 #endif
