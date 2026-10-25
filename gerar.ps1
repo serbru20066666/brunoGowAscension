@@ -126,6 +126,27 @@ function Achar-VS {
     if (-not (Test-Path $vswhere)) { return $null }
     $p = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath
     if ($p) { return ($p | Select-Object -First 1) }
+    # VS with C++ but without its Clang component: a separate LLVM (GOWA_LLVM, or the
+    # standard LLVM install) supplies clang-cl.
+    if (Achar-LLVM) {
+        $p = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if ($p) { return ($p | Select-Object -First 1) }
+        # an install vswhere does not list (copied, or registration lost): its vcvars64 is enough
+        foreach ($ed in 'BuildTools', 'Community', 'Professional', 'Enterprise') {
+            $d = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\$ed"
+            if (Test-Path "$d\VC\Auxiliary\Build\vcvars64.bat") { return $d }
+            $d = "$env:ProgramFiles\Microsoft Visual Studio\2022\$ed"
+            if (Test-Path "$d\VC\Auxiliary\Build\vcvars64.bat") { return $d }
+        }
+    }
+    return $null
+}
+# The LLVM bin folder to use: VS's own when it has one, else GOWA_LLVM or C:\Program Files\LLVM.
+function Achar-LLVM([string]$vs = '') {
+    if ($vs -and (Test-Path (Join-Path $vs 'VC\Tools\Llvm\x64\bin\clang-cl.exe'))) { return (Join-Path $vs 'VC\Tools\Llvm\x64\bin') }
+    foreach ($d in @($env:GOWA_LLVM, "$env:ProgramFiles\LLVM\bin")) {
+        if ($d -and (Test-Path (Join-Path $d 'clang-cl.exe'))) { return $d }
+    }
     return $null
 }
 Etapa '1_ferramentas' {
@@ -264,7 +285,8 @@ Etapa '5_spu' {
 }
 
 # ---------------------------------------------------------------------------- compilar
-$llvm = Join-Path $VS 'VC\Tools\Llvm\x64\bin'
+$llvm = Achar-LLVM $VS
+$env:GOWA_LLVM = $llvm
 $alvo = $Build
 if ($alvo -eq 'auto') {
     $def = (cmd /c "echo.| `"$llvm\clang.exe`" -march=native -dM -E -x c - 2>nul") -join "`n"

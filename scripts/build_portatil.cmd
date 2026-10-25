@@ -24,7 +24,9 @@ set "FFMPEG_F=%FFMPEG_DIR:\=/%"
 rem GOWA_VS = pasta do Visual Studio 2022 com "C++ Clang tools" (o gerar.ps1 acha com o vswhere)
 if "%GOWA_VS%"=="" set "GOWA_VS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
 call "%GOWA_VS%\VC\Auxiliary\Build\vcvars64.bat" >nul
-set "PATH=%GOWA_VS%\VC\Tools\Llvm\x64\bin;%PATH%"
+rem GOWA_LLVM = pasta bin de um LLVM separado, quando o VS nao tem o "C++ Clang tools"
+if "%GOWA_LLVM%"=="" set "GOWA_LLVM=%GOWA_VS%\VC\Tools\Llvm\x64\bin"
+set "PATH=%GOWA_LLVM%;%PATH%"
 if not exist "%DIR%\build.ninja" (
   cmake -S "%RAIZ%\port" -B "%DIR%" -G Ninja ^
     -DCMAKE_MAKE_PROGRAM=ninja ^
