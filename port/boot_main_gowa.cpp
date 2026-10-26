@@ -1748,7 +1748,14 @@ static DWORD WINAPI vblank_ticker(LPVOID)
             if(++s_q3 % 8 == 0){ int r=sys_event_queue_inject(qid, 0x1234, 0, 0, 0);
               static int _n=0; if(_n++<12) fprintf(stderr,"[INJQ3] injected q%u event rc=%d\n",qid,r); } }
         if (rsx_ok) {
-            if (rsx_pump_messages() != 0) { rsx_ok = 0; }
+            /* GOWA (25/10): the window was closed: the game ends. Before, only the
+             * drawing stopped and the process went on without a window, busy on
+             * two cores, until killed. */
+            if (rsx_pump_messages() != 0) {
+                fprintf(stderr, "[janela] fechada: o jogo termina\n");
+                fflush(NULL);
+                TerminateProcess(GetCurrentProcess(), 0);
+            }
             if (getenv("YDKJ_PACETRACE")) {
                 static ULONGLONG s_win=0; static int s_pf=0, s_pres=0; static ULONGLONG s_presms=0;
                 s_pf += fired; s_pres++;
