@@ -742,16 +742,23 @@ static DWORD s_pin_main_tid;
  * RSX thread and most SPUs an E-core as ideal processor (RSX 16, SPU0-4 22-27 on the
  * i7-14700KF), so in some runs the frame's critical path ran on E-cores. SPU6 goes to the
  * sibling of the last P-core. */
+/* GOWA_PIN=6 (mode 2, 26/10): like 4, but nothing is pinned to P-core 0 (the CPU Windows
+ * sends most interrupts and DPCs to; mode 4 put the main thread there), and only the
+ * frame's critical threads get a P-core to themselves: main -> P1, RSX -> P2, the EDGE SPUs
+ * SPU0-3 -> P3-P6. Everything else (SPU4-6 included) floats over P0, P7 and the E-cores.
+ * For the scenes where the EDGE SPUs are the limit (the Hecatonchires fight: SPU0-3 at
+ * 92-94%). */
 static DWORD WINAPI gowa_pin_hybrid_thread(LPVOID soft_arg)
 {
-    const int soft = soft_arg != NULL;
+    const int mode6 = (intptr_t)soft_arg == 2;
+    const int soft = (intptr_t)soft_arg == 1;
     const char* st = getenv("GOWA_PIN_START");
     Sleep((st ? (DWORD)atoi(st) : 20u) * 1000u);
     DWORD len = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
     uint8_t* buf = len ? (uint8_t*)malloc(len) : NULL;
     if (!buf || !GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)buf, &len)) { free(buf); return 0; }
-    DWORD_PTR pfirst[64]; int np = 0; DWORD_PTR emask = 0; int emax = -1;
+    DWORD_PTR pfirst[64], pall[64]; int np = 0; DWORD_PTR emask = 0; int emax = -1;
     for (DWORD off = 0; off < len; ) {
         const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(buf + off);
         if (e->Processor.EfficiencyClass > emax) emax = e->Processor.EfficiencyClass;
@@ -761,7 +768,7 @@ static DWORD WINAPI gowa_pin_hybrid_thread(LPVOID soft_arg)
         const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(buf + off);
         const DWORD_PTR m = (DWORD_PTR)e->Processor.GroupMask[0].Mask;
         if (m) {
-            if (e->Processor.EfficiencyClass == emax) { if (np < 64) pfirst[np++] = m & (~m + 1); }
+            if (e->Processor.EfficiencyClass == emax) { if (np < 64) { pall[np] = m; pfirst[np++] = m & (~m + 1); } }
             else emask |= m;
         }
         off += e->Size;
@@ -788,7 +795,19 @@ static DWORD WINAPI gowa_pin_hybrid_thread(LPVOID soft_arg)
             { PWSTR w = NULL; if (SUCCEEDED(GetThreadDescription(h, &w)) && w) { wcsncpy(nm, w, 23); LocalFree(w); } }
             DWORD_PTR want = emask;
             int role = 0;
-            if (te.th32ThreadID == s_pin_main_tid) { want = pfirst[0]; role = 1; }
+            if (mode6) {
+                /* free pool: E-cores + P0 + every P-core from 7 on */
+                DWORD_PTR pool = emask | pall[0];
+                for (int k = 7; k < np; k++) pool |= pall[k];
+                want = pool;
+                if (np >= 7) {
+                    if (te.th32ThreadID == s_pin_main_tid) want = pfirst[1];
+                    else if (!wcscmp(nm, L"RSX-present")) want = pfirst[2];
+                    else if (nm[0] == L'S' && nm[1] == L'P' && nm[2] == L'U' && nm[3] >= L'0' && nm[3] <= L'3' && !nm[4])
+                        want = pfirst[3 + (nm[3] - L'0')];
+                }
+            }
+            else if (te.th32ThreadID == s_pin_main_tid) { want = pfirst[0]; role = 1; }
             else if (!wcscmp(nm, L"RSX-present")) { want = pfirst[1]; role = 1; }
             else if (nm[0] == L'S' && nm[1] == L'P' && nm[2] == L'U' && nm[3] >= L'0' && nm[3] <= L'9' && !nm[4]) {
                 const int k = 2 + (nm[3] - L'0');
@@ -2961,11 +2980,11 @@ int main(int argc, char** argv)
        * i7-14700KF it was worse, phase 1 at 2K->4K FSR without the limiter 41.4 / 41.3 fps
        * against 54.2 / 49.6 not pinned (interleaved runs). */
       if (hybrid && !pe) fprintf(stderr, "[pin] desligado: CPU hibrida (GOWA_PIN=1 ou 4 forca)\n");
-      const int pin_h = pe && (*pe == '4' || *pe == '5');
+      const int pin_h = pe && (*pe == '4' || *pe == '5' || *pe == '6');
       const int pin = !pin_h && (pe ? (*pe != '0') : (si.dwNumberOfProcessors >= 12 && !hybrid));
       { extern int g_gowa_pin_on; g_gowa_pin_on = pin ? 1 : pin_h ? (*pe - '0') : 0; }   /* desempenho.json */
       s_pin_main_tid = GetCurrentThreadId();
-      if (pin_h) CreateThread(NULL, 0, gowa_pin_hybrid_thread, (LPVOID)(intptr_t)(*pe == '5'), 0, NULL);
+      if (pin_h) CreateThread(NULL, 0, gowa_pin_hybrid_thread, (LPVOID)(intptr_t)(*pe == '5' ? 1 : *pe == '6' ? 2 : 0), 0, NULL);
       else if (pin) CreateThread(NULL, 0, gowa_pin_thread, NULL, 0, NULL);
       else if (!pe) fprintf(stderr, "[pin] desligado: %lu CPUs lógicas (fixa só com 12 ou mais; GOWA_PIN=1 força)\n", (unsigned long)si.dwNumberOfProcessors); }
     if (getenv("GOWA_GUESTPROF"))
