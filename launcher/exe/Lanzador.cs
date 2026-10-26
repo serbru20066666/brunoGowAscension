@@ -81,7 +81,7 @@ namespace GowAscension
         readonly List<Fila> Filas = new List<Fila>();
         int Sel;
         bool Listo;
-        string Exe, Disco;
+        string Exe, Disco, DiscoTxt;
         Process Juego, Tarea;
 
         FontFamily Cinzel;
@@ -333,7 +333,7 @@ namespace GowAscension
 
         void CargarFondo()
         {
-            var pic = System.IO.Path.Combine(Vfs, "PS3_GAME", "PIC1.PNG");
+            var pic = System.IO.Path.Combine(DiscoTxt ?? Vfs, "PS3_GAME", "PIC1.PNG");
             if (Fondo.Source != null || !File.Exists(pic)) return;
             try
             {
@@ -352,6 +352,15 @@ namespace GowAscension
             if (!File.Exists(Exe)) Exe = Ruta("port", "build_native", "gowa.exe");
             Disco = LeerEnlace(Ruta("vfs", "PS3_GAME"));
             bool disco = Directory.Exists(Ruta("vfs", "PS3_GAME", "USRDIR"));
+            // disco.txt (26/10): en un disco sin enlaces (exFAT, FAT32) la carpeta de la copia del
+            // juego va escrita ahi; el juego la usa como raiz (PS3_VFS_ROOT) y los datos de la
+            // actualizacion siguen en vfs (PS3_HDD0_ROOT)
+            DiscoTxt = null;
+            if (!disco && File.Exists(Ruta("disco.txt")))
+            {
+                var dt = File.ReadAllText(Ruta("disco.txt")).Trim();
+                if (Directory.Exists(System.IO.Path.Combine(dt, "PS3_GAME", "USRDIR"))) { DiscoTxt = dt; Disco = dt; disco = true; }
+            }
             Listo = disco && File.Exists(Exe) && File.Exists(Elf) && File.Exists(Ruta("fw", "lle", "libsre_image.bin"));
             CargarFondo();
             if (!File.Exists(Ruta("gerar.ps1")))
@@ -660,6 +669,7 @@ namespace GowAscension
                 { "GOWA_RES_SCALE", Ajustes["res"] }, { "GOWA_FSR", Ajustes["fsr"] }, { "GOWA_FSR_SHARP", Ajustes["nit"] },
                 { "GOWA_FULLSCREEN", Ajustes["pant"] }, { "GOWA_LANG", Ajustes["idi"] }, { "GOWA_FLIP_HZ", Ajustes["hz"] },
                 { "GOWA_FRAMEGEN", Ajustes["fg"] }, { "GOWA_PRESENT_SYNC", Ajustes["vs"] }, { "GOWA_OSD", Ajustes["osd"] }, { "GOWA_AUDIO_MUTE", Ajustes["son"] } };
+            if (DiscoTxt != null) { e["PS3_VFS_ROOT"] = DiscoTxt; e["PS3_HDD0_ROOT"] = Vfs; }
             Directory.CreateDirectory(Ruta("saves")); Directory.CreateDirectory(Ruta("out"));
             var log = Ruta("out", "jogo.log");
             var psi = new ProcessStartInfo("cmd.exe", "/c \"\"" + Exe + "\" \"" + Elf + "\" > \"" + log + "\" 2>&1\"") { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = System.IO.Path.GetDirectoryName(Exe) };
