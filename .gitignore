@@ -55,3 +55,6 @@ __pycache__/
 
 # gerado pelo gerar.ps1
 /jogar.cmd
+
+# el lanzador compilado (va en el zip del release; se compila con launcher/exe/compilar.cmd)
+/GowAscension.exe

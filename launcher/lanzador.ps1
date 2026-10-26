@@ -50,8 +50,8 @@ $Opciones = @(
        a = 'Pantalla completa sin bordes. Durante el juego, Alt+Intro o F11 alternan.' }
     @{ k = 'idi';   t = 'Idioma'; v = @(@('Español', '3'), @('English', '1'), @('Français', '2'), @('Português', '17')); d = '3'
        a = 'Idioma de textos y voces.' }
-    @{ k = 'hz';    t = 'Límite de fps'; v = @(@('60', '60'), @('30', '30')); d = '60'
-       a = 'El juego avanza parte de su lógica por cuadro: por encima de 60 todo va más rápido. Para más fluidez, usa la generación de cuadros.' }
+    @{ k = 'hz';    t = 'Límite de fps'; v = @(@('60', '60'), @('90', '90'), @('120', '120'), @('30', '30')); d = '60'
+       a = 'Jugando, el juego casi nunca pasa de 60 por sí solo (lo frena el procesador), así que 90 y 120 apenas cambian nada; si alguna escena ligera pasa de 60, esa escena va más rápida. Para 120 cuadros en pantalla, deja 60 y activa la generación de cuadros.' }
     @{ k = 'fg';    t = 'Generación de cuadros'; v = @(@('No', '0'), @('Sí', '1')); d = $(if ($Monitor[2] -ge 100) { '1' } else { '0' })
        a = 'Inserta un cuadro intermedio entre cada dos del juego: con el juego a 60, 120 cuadros por segundo en pantalla. Útil en monitores de 100 Hz o más (activada por defecto en ellos).' }
     @{ k = 'vs';    t = 'Sincronía vertical'; v = @(@('Sí', '1'), @('No', '0')); d = '1'
