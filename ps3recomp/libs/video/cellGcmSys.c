@@ -2099,8 +2099,11 @@ void cellGcm_fifo_kick_wait(unsigned ms)
     /* GOWA_IDLE_POLL=1: the same short timer for every idle wait, not only on
      * a standing park (A/B; the game never writes put, so an empty FIFO
      * only wakes on this timeout) */
+    /* 26/10: on by default (=0 off). Phase 1's big fight, 2K without FSR, limit 60, i7-14700KF:
+     * with it and GOWA_FP_HASH_MEMO 55.8 / 55.7 fps over the fight (minimum 46) against
+     * 54.8 / 49.7 (minimum 41-42) without (interleaved runs). */
     static int idle_poll = -1;
-    if (idle_poll < 0) { const char* e = getenv("GOWA_IDLE_POLL"); idle_poll = e && *e == '1'; }
+    if (idle_poll < 0) { const char* e = getenv("GOWA_IDLE_POLL"); idle_poll = !(e && *e == '0'); }
     if (ev && park_us > 0 && (g_gcm_fifo_parked || idle_poll)) {
         LARGE_INTEGER due; due.QuadPart = -(LONGLONG)park_us * 10;
         if (SetWaitableTimer(park_timer, &due, 0, NULL, NULL, FALSE)) {

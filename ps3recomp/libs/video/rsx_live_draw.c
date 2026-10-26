@@ -1242,9 +1242,16 @@ static HANDLE g_ld_present_thread_handle = NULL;
 #endif
 
 static void ld_present_measure_dump(void);
-#if defined(YZ_PERF_PROFILE)
+#if defined(YZ_PERF_PROFILE) && !defined(YZ_SPU_PERF)
+/* 26/10: YZ_PERF_PROFILE alone (the RSX frame breakdown) links without the SPU window
+ * sampler, which only exists in that profiling build */
+static void spu_perf_window_begin(u32 guest_frame) { (void)guest_frame; }
+static void spu_perf_window_dump(u32 guest_frame) { (void)guest_frame; }
+#elif defined(YZ_PERF_PROFILE)
 extern void spu_perf_window_begin(u32 guest_frame);
 extern void spu_perf_window_dump(u32 guest_frame);
+#endif
+#if defined(YZ_PERF_PROFILE)
 extern void spu_perf_frame_sample_record(u32 guest_frame);
 extern void spu_perf_frame_sample_dump(u32 guest_start, u32 guest_end);
 #endif
@@ -6663,10 +6670,46 @@ static ID3D12PipelineState* get_pso(
             g_ld_vpc_lo = s_vpc[h].lo; g_ld_vpc_hi = s_vpc[h].hi;
         }
     }
-    if (ld_fp_constants_buffered())
-        key = rsx_fp_structural_hash(fp_uc, fp_size, key);
-    else
-        key = fnv1a(fp_uc, fp_size, key);
+    /* GOWA_FP_HASH_MEMO (26/10, default on; =0 off): the fragment program hash, remembered per
+     * (address, size, incoming key, mode) with a copy of the program bytes. A memcmp against
+     * the copy proves the program unchanged and returns the same key the hash would; the
+     * byte-wise hash ran on every draw (~1,200 a frame in phase 1's big fight, get_pso was
+     * 18% of the RSX thread there). */
+    {
+        static int memo = -1;
+        if (memo < 0) { const char* e = getenv("GOWA_FP_HASH_MEMO"); memo = !(e && *e == '0'); }
+        const int structural = ld_fp_constants_buffered();
+        enum { FPM_N = 1024 };
+        static struct { const u8* src; u32 size; u32 structural; u64 key_in, key_out; u8* copy; u32 cap; } s_fpm[FPM_N];
+        u32 h = 0;
+        if (memo) {
+            h = (u32)((((uintptr_t)fp_uc) * 0x9E3779B97F4A7C15ull ^ key * 0xC2B2AE3D27D4EB4Full ^ fp_size) >> 40) & (FPM_N - 1u);
+            if (s_fpm[h].src == fp_uc && s_fpm[h].size == fp_size && s_fpm[h].structural == (u32)structural &&
+                s_fpm[h].key_in == key && s_fpm[h].copy && !memcmp(s_fpm[h].copy, fp_uc, fp_size)) {
+                key = s_fpm[h].key_out;
+                goto ld_fp_hashed;
+            }
+        }
+        {
+            const u64 key_in = key;
+            if (structural)
+                key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+            else
+                key = fnv1a(fp_uc, fp_size, key);
+            if (memo && fp_size <= 0x10000u) {
+                if (s_fpm[h].cap < fp_size) {
+                    u8* c = (u8*)realloc(s_fpm[h].copy, fp_size);
+                    if (c) { s_fpm[h].copy = c; s_fpm[h].cap = fp_size; }
+                }
+                if (s_fpm[h].copy && s_fpm[h].cap >= fp_size) {
+                    memcpy(s_fpm[h].copy, fp_uc, fp_size);
+                    s_fpm[h].src = fp_uc; s_fpm[h].size = fp_size; s_fpm[h].structural = (u32)structural;
+                    s_fpm[h].key_in = key_in; s_fpm[h].key_out = key;
+                }
+            }
+        }
+    }
+ld_fp_hashed:
     if (!key) {
         LD_PSO_BAIL("shader hash collapsed to zero");
         return NULL;
