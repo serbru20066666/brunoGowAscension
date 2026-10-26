@@ -284,6 +284,7 @@ typedef struct {
     u64 content_hash;
     u32 last_hash_frame;
     u64 last_use_serial;
+    u32 shared;              /* GOWA_TEX_DEDUP: tex is also held by another entry (never update it in place) */
 } texcache_t;
 typedef struct {
     u32 location, offset, format, width, height, pitch;
@@ -787,6 +788,10 @@ static void ld_osd_texto(void)
           if (g_ld_gpu_nome[0]) snprintf(s_osd_txt3, sizeof s_osd_txt3, "GPU %s (%u GB)", g_ld_gpu_nome, (g_ld_gpu_vram_mb + 512) / 1024);
           else s_osd_txt3[0] = 0; }
     } else { snprintf(s_osd_txt, sizeof s_osd_txt, "FPS --"); s_osd_txt2[0] = 0; }
+    /* GOWA_OSD_LOG=1 (26/10): the meter's first line in the log every ~5 s (GPU busy, CPU) */
+    { static int lg = -1; static ULONGLONG ult = 0;
+      if (lg < 0) { const char* e = getenv("GOWA_OSD_LOG"); lg = e && *e == '1'; }
+      if (lg && GetTickCount64() - ult >= 5000) { ult = GetTickCount64(); fprintf(stderr, "[osd] %s\n", s_osd_txt); } }
     t0 = agora.QuadPart; f0 = f1; i0 = i1; k0 = k1; u0 = u1;
 }
 static void ld_osd_desenha(void)
@@ -3862,6 +3867,68 @@ static void tex_index_rebuild(void)
     for (u32 i = 0; i < g.n_textures; i++) tex_index_put(i);
     s_tex_index_ready = 1;
 }
+/* GOWA_TEX_DEDUP (26/10, default on; =0 off): a texture that enters the cache with the
+ * content, format and size of one already decoded shares that GPU resource (one reference
+ * per entry) instead of being decoded, created and uploaded again. In phase 1's heavy
+ * stretch the game copies its textures to new addresses: 95-99% of the 700-1,400 new
+ * cache entries every 5 s had content already seen, 380-820 ms of the RSX thread per 5 s.
+ * A shared resource is never updated in place (the refresh decodes into a new one). */
+#define TEX_CONTENT_SIZE 32768u
+static int32_t s_tex_content[TEX_CONTENT_SIZE];
+static int s_tex_content_ready;
+static int ld_tex_dedup_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GOWA_TEX_DEDUP"); on = !(e && *e == '0'); }
+    return on;
+}
+static u32 tex_content_slot(const texcache_t* e)
+{
+    u64 k = e->content_hash ^ ((u64)e->format << 56) ^ ((u64)e->width << 40) ^ ((u64)e->height << 24) ^
+            ((u64)e->pitch << 8) ^ e->remap ^ ((u64)e->cubemap << 63) ^ ((u64)e->depth3d << 50);
+    return (u32)((k * 0x9E3779B97F4A7C15ull) >> 49) & (TEX_CONTENT_SIZE - 1u);
+}
+static int tex_content_same(const texcache_t* a, const texcache_t* b)
+{
+    return a->content_hash == b->content_hash && a->format == b->format && a->width == b->width &&
+           a->height == b->height && a->pitch == b->pitch && a->remap == b->remap &&
+           a->cubemap == b->cubemap && a->depth3d == b->depth3d;
+}
+static int ld_tex_find_by_content(const texcache_t* r)
+{
+    if (!s_tex_content_ready) return -1;
+    u32 slot = tex_content_slot(r);
+    for (u32 probe = 0; probe < 64; probe++, slot = (slot + 1u) & (TEX_CONTENT_SIZE - 1u)) {
+        const int32_t i = s_tex_content[slot];
+        if (i < 0) return -1;
+        if ((u32)i < g.n_textures && g.textures[i].tex && tex_content_same(&g.textures[i], r)) return i;
+    }
+    return -1;
+}
+static u32 s_tex_content_puts;
+static void ld_tex_content_insert(u32 i)
+{
+    const texcache_t* e = &g.textures[i];
+    if (!e->content_hash || !e->tex) return;
+    u32 slot = tex_content_slot(e);
+    for (u32 probe = 0; probe < 64; probe++, slot = (slot + 1u) & (TEX_CONTENT_SIZE - 1u)) {
+        const int32_t cur = s_tex_content[slot];
+        if (cur < 0) { s_tex_content[slot] = (int32_t)i; s_tex_content_puts++; return; }
+        if ((u32)cur == i) return;
+        if ((u32)cur < g.n_textures && g.textures[cur].tex && tex_content_same(&g.textures[cur], e)) return;
+    }
+}
+static void ld_tex_content_put(u32 i)
+{
+    /* slots are never cleared one by one (an entry whose content changed just stops
+     * matching); rebuild from the live entries once half the table has been used */
+    if (!s_tex_content_ready || s_tex_content_puts > TEX_CONTENT_SIZE / 2u) {
+        memset(s_tex_content, 0xFF, sizeof s_tex_content);
+        s_tex_content_ready = 1; s_tex_content_puts = 0;
+        for (u32 k = 0; k < g.n_textures; k++) if (k != i) ld_tex_content_insert(k);
+    }
+    ld_tex_content_insert(i);
+}
 /* GOWA_TEX_DUMP_SEC=<s>[,max]: from <s> seconds after the first texture
  * lookup, the raw guest bytes of each distinct texture bound (up to max,
  * default 400) go to out\texdump\<loc>_<offset>_<fmt>_<w>x<h>_r<remap>.bin --
@@ -3979,7 +4046,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
               } }
             entry->last_hash_frame = g_ld_frames;
             if (readable && hash != entry->content_hash) {
-                g_ld_reuse_tex = entry->cubemap ? NULL : entry->tex;
+                g_ld_reuse_tex = (entry->cubemap || entry->shared) ? NULL : entry->tex;
                 ID3D12Resource* replacement =
                     decode_guest_texture_profiled(t, remap);
                 g_ld_reuse_tex = NULL;
@@ -3987,6 +4054,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                     ID3D12Resource* old = entry->tex;
                     entry->tex = replacement;
                     entry->content_hash = hash;
+                    if (old != replacement) entry->shared = 0;   /* its own resource now */
+                    if (ld_tex_dedup_on()) ld_tex_content_put(i);
                     if (old != replacement) {
                         write_texture_srv(i, entry);
                         retire_texture(old);
@@ -4051,11 +4120,45 @@ ld_tex_intacta:
     replacement.depth3d = tex_depth3d(t);
     replacement.last_hash_frame = g_ld_frames;
     replacement.last_use_serial = ++g_ld_texture_use_serial;
-    {
-        int readable = 0;
-        replacement.content_hash = texture_content_hash(t, &readable);
-    }
-    replacement.tex = decode_guest_texture_profiled(t, remap);
+    /* GOWA_TEXNOVA_LOG=1 (26/10): every 5 s, how many textures entered the cache and how long
+     * hashing + decoding + creating them took on this (the RSX) thread. In phase 1's heavy
+     * stretch the cache grows ~4 entries per frame. */
+    LARGE_INTEGER tn0; QueryPerformanceCounter(&tn0);
+    int nova_readable = 0, shared_from = -1;
+    replacement.content_hash = texture_content_hash(t, &nova_readable);
+    if (ld_tex_dedup_on() && nova_readable && replacement.content_hash)
+        shared_from = ld_tex_find_by_content(&replacement);
+    if (shared_from >= 0) {
+        ID3D12Resource* same = g.textures[shared_from].tex;
+        same->lpVtbl->AddRef(same);          /* this entry's own reference */
+        replacement.tex = same;
+        replacement.shared = 1;
+        g.textures[shared_from].shared = 1;
+    } else
+        replacement.tex = decode_guest_texture_profiled(t, remap);
+    { static int lg = -1; static LARGE_INTEGER f, t0; static u32 n, nshared; static double ms; static u64 kb;
+      if (shared_from >= 0) nshared++;
+      if (lg < 0) { const char* e = getenv("GOWA_TEXNOVA_LOG"); lg = e && *e == '1'; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
+      if (lg) {
+          LARGE_INTEGER tn1; QueryPerformanceCounter(&tn1);
+          n++; ms += (double)(tn1.QuadPart - tn0.QuadPart) * 1000.0 / (double)f.QuadPart;
+          kb += ((u64)t->width * t->height * 4u) / 1024u;
+          /* how many of them have the content (and format/size) of a texture already seen */
+          { enum { RN = 1 << 16 }; static u64 rk[RN]; static u32 rep;
+            const u64 key = replacement.content_hash ^ ((u64)t->format << 56) ^ ((u64)t->width << 40) ^ ((u64)t->height << 24) ^ t->pitch;
+            if (replacement.content_hash) {
+                u32 s = (u32)(key * 0x9E3779B97F4A7C15ull >> 48);
+                for (u32 k = 0; k < 64; k++, s = (s + 1) & (RN - 1)) {
+                    if (rk[s] == key) { rep++; break; }
+                    if (!rk[s]) { rk[s] = key; break; }
+                }
+            }
+            if (tn1.QuadPart - t0.QuadPart > f.QuadPart * 5) {
+                fprintf(stderr, "[texnova] 5 s: %u nuevas (%u con contenido ya visto, %u compartidas), %.1f ms en el hilo RSX, ~%llu MB (RGBA), cache %u/%u\n",
+                        n, rep, nshared, ms, (unsigned long long)(kb / 1024u), g.n_textures, (unsigned)MAX_TEXTURES);
+                t0 = tn1; n = 0; ms = 0; kb = 0; rep = 0; nshared = 0;
+            } }
+      } }
     if (replacement.tex) {
         texcache_t* entry = &g.textures[index];
         if (evicted)
@@ -4063,6 +4166,7 @@ ld_tex_intacta:
         *entry = replacement;
         write_texture_srv(index, entry);
         tex_index_put(index);
+        if (ld_tex_dedup_on()) ld_tex_content_put(index);
     } else {
         if (!cache_was_full) {
             g.textures[index] = replacement;

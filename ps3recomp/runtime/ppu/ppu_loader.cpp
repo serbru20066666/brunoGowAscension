@@ -2609,6 +2609,35 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     }
     static int on = -1;
     if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
+    /* GOWA_ICALL_TIME=<lr hex> (26/10): time the indirect calls made from that return
+     * address, per target, and print the totals every 10 s. The profiler only says that a
+     * sample landed in runtime code under the caller; this says which callee it was. */
+    { static int64_t wl = -2;
+      if (wl == -2) { const char* e = getenv("GOWA_ICALL_TIME"); wl = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+      if (wl >= 0 && (uint32_t)ctx->lr == (uint32_t)wl) {
+          enum { TN = 64 };
+          static uint32_t tk[TN]; static uint64_t tus[TN], tn[TN]; static SRWLOCK tl = SRWLOCK_INIT;
+          static LARGE_INTEGER tf, t0;
+          if (!tf.QuadPart) { QueryPerformanceFrequency(&tf); QueryPerformanceCounter(&t0); }
+          const uint32_t tgt = (uint32_t)ctx->ctr;
+          LARGE_INTEGER a, b; QueryPerformanceCounter(&a);
+          ps3_indirect_call_impl(ctx);
+          QueryPerformanceCounter(&b);
+          const uint64_t us = (uint64_t)((b.QuadPart - a.QuadPart) * 1000000 / tf.QuadPart);
+          AcquireSRWLockExclusive(&tl);
+          int i = 0; for (; i < TN && tk[i] && tk[i] != tgt; i++) {}
+          if (i < TN) { tk[i] = tgt; tus[i] += us; tn[i]++; }
+          if ((b.QuadPart - t0.QuadPart) > tf.QuadPart * 10) {
+              t0 = b;
+              for (int j = 0; j < TN && tk[j]; j++)
+                  if (tn[j]) fprintf(stderr, "[icall-time] lr=0x%08X target=0x%08X calls=%llu total=%llums media=%lluus\n",
+                                     (uint32_t)wl, tk[j], (unsigned long long)tn[j], (unsigned long long)(tus[j] / 1000),
+                                     (unsigned long long)(tus[j] / tn[j]));
+              memset(tus, 0, sizeof tus); memset(tn, 0, sizeof tn);
+          }
+          ReleaseSRWLockExclusive(&tl);
+          return;
+      } }
     { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
       if (hg) { const uint32_t tgt = (uint32_t)ctx->ctr; icall_hist(ctx, tgt, 0);
                 ps3_indirect_call_impl(ctx); icall_hist(ctx, tgt, 1); return; } }
