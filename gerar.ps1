@@ -221,6 +221,12 @@ Etapa '3_firmware' {
     $fw = Join-Path $R 'fw'; $lle = Join-Path $fw 'lle'
     New-Item -ItemType Directory -Force $lle | Out-Null
     $ch = $ChavesRpcs3; if (-not $ch) { $ch = Join-Path $R 'dl\rpcs3_chaves' }
+    # 25/10: o próprio PS3UPDAT.PUP (o firmware oficial da Sony) em vez do RPCS3:
+    # scripts\gpl\pup_libsre.py tira dele o libsre.sprx
+    if ((Test-Path $Firmware -PathType Leaf) -and $Firmware -match '\.pup$') {
+        $sprx = Join-Path $fw 'libsre.sprx'
+        Exec $LOG "python `"$R\scripts\gpl\pup_libsre.py`" `"$Firmware`" `"$sprx`" --vault `"$ch`" --baixar"
+    }
     Exec $LOG "python `"$R\scripts\gpl\unself.py`" `"$sprx`" `"$fw\libsre.prx`" --vault `"$ch`" --baixar"
     Push-Location (Join-Path $R 'ps3recomp')
     try {
