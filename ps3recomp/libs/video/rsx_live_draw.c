@@ -6197,6 +6197,101 @@ static void gowa_plib_tick(void)
     free(buf);
 }
 
+/* GOWA_ASYNC_SHADERS (26/10, default on; =0 off): a shader that is in neither cache is
+ * compiled by worker threads instead of on the RSX thread. Until it is ready the draws
+ * that need it are skipped (the object appears a few frames late) instead of the whole
+ * frame stopping: D3DCompile (FXC) took 40-150 ms per shader on the first visit to an area
+ * (frames of 150-264 ms in phase 1). The worker stores the blob in the disk cache (written
+ * to a temporary file and renamed), where the next lookup finds it. A shader whose
+ * background compile failed is compiled here as before, so its error is logged. */
+static int g_ld_pso_pending;
+typedef struct ld_async_job { struct ld_async_job* next; u32 stage; u64 hash; u32 len; char* src; } ld_async_job;
+static SRWLOCK s_async_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_async_cv = CONDITION_VARIABLE_INIT;
+static ld_async_job* s_async_head;
+static ld_async_job* s_async_tail;
+enum { LD_ASYNC_SLOTS = 2048 };
+static struct { u64 hash; u32 stage; u32 state; } s_async_slot[LD_ASYNC_SLOTS];   /* state 1 pending, 2 failed */
+static volatile LONG s_async_done, s_async_queued;
+static int ld_async_shaders_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GOWA_ASYNC_SHADERS"); on = !(e && *e == '0'); }
+    return on;
+}
+static u32 ld_async_slot_of(u32 stage, u64 hash)
+{
+    u32 s = (u32)((hash * 0x9E3779B97F4A7C15ull ^ stage) >> 53) & (LD_ASYNC_SLOTS - 1u);
+    for (u32 p = 0; p < LD_ASYNC_SLOTS; p++, s = (s + 1u) & (LD_ASYNC_SLOTS - 1u))
+        if (!s_async_slot[s].state || (s_async_slot[s].hash == hash && s_async_slot[s].stage == stage)) return s;
+    return 0xFFFFFFFFu;
+}
+static DWORD WINAPI ld_async_worker(LPVOID unused)
+{
+    (void)unused;
+    SetThreadDescription(GetCurrentThread(), L"shader-compile");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        AcquireSRWLockExclusive(&s_async_lock);
+        while (!s_async_head) SleepConditionVariableSRW(&s_async_cv, &s_async_lock, INFINITE, 0);
+        ld_async_job* j = s_async_head;
+        s_async_head = j->next;
+        if (!s_async_head) s_async_tail = NULL;
+        ReleaseSRWLockExclusive(&s_async_lock);
+        ID3DBlob* blob = NULL; ID3DBlob* err = NULL;
+        const HRESULT hr = D3DCompile(j->src, j->len, j->stage == 'V' ? "xvs" : "xps", NULL, NULL, "main",
+                                      j->stage == 'V' ? "vs_5_0" : "ps_5_0", 0, 0, &blob, &err);
+        if (SUCCEEDED(hr) && blob) shader_disk_cache_store(j->stage, j->src, j->len, j->hash, blob);
+        if (blob) blob->lpVtbl->Release(blob);
+        if (err) err->lpVtbl->Release(err);
+        AcquireSRWLockExclusive(&s_async_lock);
+        const u32 s = ld_async_slot_of(j->stage, j->hash);
+        /* slots are never freed (the probe chains stay intact); a finished shader is found
+         * by the next disk lookup, so its slot is only consulted if that store failed */
+        if (s != 0xFFFFFFFFu) s_async_slot[s].state = SUCCEEDED(hr) ? 3u : 2u;
+        ReleaseSRWLockExclusive(&s_async_lock);
+        InterlockedIncrement(&s_async_done);
+        free(j->src); free(j);
+    }
+    return 0;
+}
+/* 1 = the shader is (now) being compiled in the background: skip this draw;
+ * 0 = compile it here (async off, its background compile failed, or no room) */
+static int ld_async_compile(u32 stage, const char* src, u32 len, u64 hash)
+{
+    if (!ld_async_shaders_on()) return 0;
+    static volatile LONG started;
+    if (InterlockedExchange(&started, 1) == 0) {
+        SYSTEM_INFO si; GetSystemInfo(&si);
+        const int n = si.dwNumberOfProcessors >= 16 ? 4 : si.dwNumberOfProcessors >= 8 ? 2 : 1;
+        for (int i = 0; i < n; i++) CreateThread(NULL, 0, ld_async_worker, NULL, 0, NULL);
+        fprintf(stderr, "[async-shaders] %d threads de compilacion\n", n);
+    }
+    AcquireSRWLockExclusive(&s_async_lock);
+    const u32 s = ld_async_slot_of(stage, hash);
+    int ret = 0;
+    if (s == 0xFFFFFFFFu) ret = 0;
+    else if (s_async_slot[s].state == 1) ret = 1;                 /* still compiling */
+    else if (s_async_slot[s].state == 2) ret = 0;                 /* failed: compile here, log the error */
+    else if (s_async_slot[s].state == 3) ret = 0;                 /* done but not on disk (store failed): here */
+    else {
+        ld_async_job* j = (ld_async_job*)malloc(sizeof *j);
+        char* c = j ? (char*)malloc(len + 1u) : NULL;
+        if (j && c) {
+            memcpy(c, src, len); c[len] = 0;
+            j->next = NULL; j->stage = stage; j->hash = hash; j->len = len; j->src = c;
+            if (s_async_tail) s_async_tail->next = j; else s_async_head = j;
+            s_async_tail = j;
+            s_async_slot[s].hash = hash; s_async_slot[s].stage = stage; s_async_slot[s].state = 1;
+            InterlockedIncrement(&s_async_queued);
+            WakeConditionVariable(&s_async_cv);
+            ret = 1;
+        } else { free(j); free(c); }
+    }
+    ReleaseSRWLockExclusive(&s_async_lock);
+    return ret;
+}
+
 static ID3D12PipelineState* build_pso(
     const char* vs_hlsl, const char* ps_hlsl, const render_state_t* rs,
     const rsx_vertex_layout_plan* masked_layout, int packed_offsets)
@@ -6245,6 +6340,9 @@ static ID3D12PipelineState* build_pso(
             shader_blob_cache_insert_accounted(
                 &g.vs_blobs, vs_hlsl, vs_length, vs_hash, vs,
                 'V', vs_hash_seen);
+        } else if (ld_async_compile('V', vs_hlsl, vs_length, vs_hash)) {
+            g_ld_pso_pending = 1;
+            return NULL;
         } else {
 #if defined(YZ_PERF_PROFILE)
             g_ld_profile.total.vs_compile_calls++;
@@ -6307,6 +6405,10 @@ static ID3D12PipelineState* build_pso(
             shader_blob_cache_insert_accounted(
                 &g.ps_blobs, ps_hlsl, ps_length, ps_hash, ps,
                 'P', ps_hash_seen);
+        } else if (ld_async_compile('P', ps_hlsl, ps_length, ps_hash)) {
+            vs->lpVtbl->Release(vs);
+            g_ld_pso_pending = 1;
+            return NULL;
         } else {
 #if defined(YZ_PERF_PROFILE)
             g_ld_profile.total.ps_compile_calls++;
@@ -6922,6 +7024,14 @@ ld_fp_hashed:
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.pso_misses++;
 #endif
+    /* GOWA_ASYNC_SHADERS: a key whose shader is still compiling in the background is retried
+     * at most once per frame -- the miss path translates both programs to HLSL, and redoing
+     * that on every draw that needs it cost ~1,000 translations (130 ms) per frame */
+    enum { PSO_PEND_N = 4096 };
+    static struct { u64 key; u32 frame; } s_pso_pend[PSO_PEND_N];
+    const u32 pend_slot = (u32)((key * 0x9E3779B97F4A7C15ull) >> 52) & (PSO_PEND_N - 1u);
+    if (s_pso_pend[pend_slot].key == key && s_pso_pend[pend_slot].frame == g_ld_frames)
+        return NULL;
     if (g.n_psos >= MAX_PSOS) {
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.pso_full++;
@@ -7200,9 +7310,17 @@ ld_fp_hashed:
         snprintf(fn, sizeof fn, "%s/hlsl_%016llx.ps.txt", hd, (unsigned long long)live_legacy_pso_key());
         f = fopen(fn, "wb"); if (f) { fputs(fi > 0 ? ps_hlsl : "<fp fail>", f); fclose(f); }
       } }
+    g_ld_pso_pending = 0;
     if (vi > 0 && fi > 0)
         pso = build_pso(
             vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload);
+    /* GOWA_ASYNC_SHADERS: a shader still compiling in the background -- skip this draw and
+     * do not remember the key, so the next draw retries */
+    if (g_ld_pso_pending) {
+        g_ld_pso_pending = 0;
+        s_pso_pend[pend_slot].key = key; s_pso_pend[pend_slot].frame = g_ld_frames;
+        return NULL;
+    }
 
     g.psos[g.n_psos].key = key;
     g.psos[g.n_psos].pso = pso;
