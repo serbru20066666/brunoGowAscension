@@ -18,7 +18,8 @@ Esta versión parte del port de [otavix010](https://github.com/otavix010/gow-asc
 | **Español completo** | Textos, voces y cinemáticas en español (y en inglés, francés y portugués). Antes las cinemáticas salían mudas y en el juego solo se oían efectos con un disco europeo. |
 | **Tarjetas AMD** | Arreglados dos fallos de dibujo que solo pasaban en AMD: un triángulo negro tapando la mitad de la cinemática de apertura y manchas en la piel de Kratos (la Furia salía gris). |
 | **FSR 1** | Renderizado a 1440p (o la resolución que elijas) escalado a la de tu monitor con FSR 1 (EASU + RCAS). |
-| **Generación de cuadros** | El juego sigue a sus 60 fps y en pantalla salen **120 cuadros por segundo**, sin bajar el rendimiento del juego (va en un hilo propio). |
+| **Generación de cuadros (experimental)** | El juego sigue a sus 60 fps y en pantalla salen **120 cuadros por segundo** (va en un hilo propio). |
+| **Texturas compartidas** | Las texturas que el juego copia a otra parte de la memoria se reutilizan en vez de subirse otra vez a la GPU: menos tirones en las peleas grandes y la VRAM deja de crecer (de 6,8 GB a 1,5 GB en la fase 1). |
 | **Lanzador `GowAscension.exe`** | Con el estilo de los menús del juego. La primera vez pide la carpeta de tu copia y lo prepara todo solo (descarga la actualización y el firmware de Sony e instala lo que falte); después, ajustes y **JUGAR**. |
 | **Pantalla completa** | Alt+Intro o F11 pasan de ventana a pantalla completa sin bordes (antes la imagen se congelaba). |
 | **Medidor en pantalla** | FPS, resolución, generación de cuadros, modelo de tarjeta gráfica, CPU, GPU y memoria (F10). |
@@ -54,8 +55,8 @@ Ajustes del lanzador (se guardan en `%APPDATA%\GowAscensionLanzador\ajustes.json
 - **Escalado FSR 1** y su **nitidez**: escala la imagen a la resolución de tu monitor, que se detecta sola.
 - **Modo de pantalla**: pantalla completa sin bordes o ventana de cualquier tamaño. Durante el juego, Alt+Intro o F11 alternan.
 - **Idioma**: español, inglés, francés o portugués.
-- **Límite de fps**: 60, 90, 120 o 30. Jugando, el juego casi nunca pasa de 60 por sí solo (lo frena la CPU), así que 90 y 120 apenas cambian nada; para 120 en pantalla, usa la generación de cuadros. El juego avanza parte de su lógica por cuadro: una escena que pase de 60 va más rápida.
-- **Generación de cuadros**: 120 cuadros por segundo en pantalla con el juego a 60. Activada por defecto con monitores de 100 Hz o más.
+- **Límite de fps**: 60 (como en el PS3) o 30. Las animaciones avanzan por cuadro: por encima de 60 los golpes y los labios se adelantan al sonido.
+- **Generación de cuadros (experimental)**: 120 cuadros por segundo en pantalla con el juego a 60, en monitores de 100 Hz o más. Apagada por defecto.
 - **Sincronía vertical**, **medidor en pantalla** (F10) y **sonido**.
 
 **CARPETA DEL JUEGO** cambia a otra copia del disco sin volver a compilar. Las partidas guardadas van a `saves\`; el registro de la última partida, a `out\jogo.log`.
