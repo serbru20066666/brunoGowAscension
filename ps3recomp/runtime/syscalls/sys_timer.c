@@ -12,6 +12,10 @@
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+#ifdef _WIN32
+#include <intrin.h>   /* _ReturnAddress (GOWA_TB_TRACE) */
+#endif
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -58,9 +62,77 @@ int lv2_deadline_passed(int64_t deadline)
  * polled. Overflow-safe split multiply (rem < qpf, so
  * rem * 79.8e6 < ~8e14 << 2^63).
  * -----------------------------------------------------------------------*/
+#ifdef _WIN32
+/* GOWA_TB_TRACE=1 (diagnostic): counts the timebase reads by host return address (the
+ * lifted guest function that read it) and prints, every 10 s, the most frequent ones as
+ * reads per second with their RVA (look them up in gowa.map). A function the main thread
+ * reads about once per frame is a candidate for the game's frame clock. */
+#define TBT_N 4096
+static volatile uintptr_t s_tbt_key[TBT_N];
+static volatile LONG s_tbt_cnt[TBT_N];
+static volatile LONG s_tbt_main[TBT_N];
+DWORD g_tbt_main_tid;   /* the game's main thread (boot_main_gowa.cpp) */
+static DWORD WINAPI tbt_dump_thread(LPVOID unused)
+{
+    (void)unused;
+    const uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    for (;;) {
+        Sleep(10000);
+        uintptr_t k[24]; LONG c[24], m[24]; int n = 0;
+        for (int i = 0; i < TBT_N; i++) {
+            const LONG v = InterlockedExchange(&s_tbt_cnt[i], 0);
+            const LONG vm = InterlockedExchange(&s_tbt_main[i], 0);
+            if (!v) continue;
+            int j;
+            if (n < 24) j = n++;
+            else if (v > c[23]) j = 23;
+            else continue;
+            k[j] = s_tbt_key[i]; c[j] = v; m[j] = vm;
+            while (j > 0 && c[j] > c[j - 1]) {
+                uintptr_t tk = k[j]; LONG tc = c[j], tm = m[j];
+                k[j] = k[j - 1]; c[j] = c[j - 1]; m[j] = m[j - 1];
+                k[j - 1] = tk; c[j - 1] = tc; m[j - 1] = tm; j--;
+            }
+        }
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, "[tbtrace] %9.1f/s (principal %9.1f/s) rt RVA 0x%08llX\n",
+                    c[i] / 10.0, m[i] / 10.0, (unsigned long long)(k[i] - base));
+        fprintf(stderr, "[tbtrace] --\n");
+    }
+    return 0;
+}
+static void tbt_note(uintptr_t ra)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("GOWA_TB_TRACE");
+        on = (e && *e == '1') ? 1 : 0;
+        if (on) CreateThread(NULL, 0, tbt_dump_thread, NULL, 0, NULL);
+    }
+    if (!on) return;
+    const int is_main = GetCurrentThreadId() == g_tbt_main_tid;
+    const size_t h = (size_t)(((uint64_t)ra * 0x9E3779B97F4A7C15ull) >> 52);
+    for (int i = 0; i < 64; i++) {
+        const size_t j = (h + i) & (TBT_N - 1);
+        if (s_tbt_key[j] != ra) {
+            if (s_tbt_key[j]) continue;
+            InterlockedCompareExchangePointer((PVOID volatile*)&s_tbt_key[j], (PVOID)ra, NULL);
+            if (s_tbt_key[j] != ra) continue;
+        }
+        InterlockedIncrement(&s_tbt_cnt[j]);
+        if (is_main) InterlockedIncrement(&s_tbt_main[j]);
+        return;
+    }
+}
+#endif
+
+#ifdef _WIN32
+__declspec(noinline)
+#endif
 uint64_t ppu_timebase_now(void)
 {
 #ifdef _WIN32
+    tbt_note((uintptr_t)_ReturnAddress());
     static LONGLONG t0 = 0;
     ensure_qpc_init();
     LARGE_INTEGER now;

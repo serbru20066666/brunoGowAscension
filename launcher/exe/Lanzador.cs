@@ -137,10 +137,10 @@ namespace GowAscension
                 "Pantalla completa sin bordes. Durante el juego, Alt+Intro o F11 alternan."));
             Opciones.Add(new Opcion("idi", "Idioma", new[] { new[] { "Español", "3" }, new[] { "English", "1" }, new[] { "Français", "2" }, new[] { "Português", "17" } }, "3",
                 "Idioma de textos y voces."));
-            Opciones.Add(new Opcion("hz", "Límite de fps", new[] { new[] { "60", "60" }, new[] { "90", "90" }, new[] { "120", "120" }, new[] { "30", "30" } }, "60",
-                "Jugando, el juego casi nunca pasa de 60 por sí solo (lo frena el procesador), así que 90 y 120 apenas cambian nada; si alguna escena ligera pasa de 60, esa escena va más rápida. Para 120 cuadros en pantalla, deja 60 y activa la generación de cuadros."));
-            Opciones.Add(new Opcion("fg", "Generación de cuadros", new[] { new[] { "No", "0" }, new[] { "Sí", "1" } }, Monitor[2] >= 100 ? "1" : "0",
-                "Inserta un cuadro intermedio entre cada dos del juego: con el juego a 60, 120 cuadros por segundo en pantalla. Útil en monitores de 100 Hz o más (activada por defecto en ellos)."));
+            Opciones.Add(new Opcion("hz", "Límite de fps", new[] { new[] { "60", "60" }, new[] { "30", "30" } }, "60",
+                "Como en el PS3, el juego va como máximo a 60 cuadros por segundo. 30 deja la CPU y la GPU más descansadas en equipos modestos."));
+            Opciones.Add(new Opcion("fg", "Generación de cuadros (experimental)", new[] { new[] { "No", "0" }, new[] { "Sí", "1" } }, "0",
+                "Experimental: inserta un cuadro inventado entre cada dos del juego (con el juego a 60, 120 en pantalla, en monitores de 100 Hz o más). Puede dejar marcas en los bordes de lo que se mueve rápido y quita algo de rendimiento al juego."));
             Opciones.Add(new Opcion("vs", "Sincronía vertical", new[] { new[] { "Sí", "1" }, new[] { "No", "0" } }, "1",
                 "Espera al refresco del monitor al presentar cada cuadro (sin cortes de imagen)."));
             Opciones.Add(new Opcion("osd", "Medidor en pantalla", new[] { new[] { "Sí", "1" }, new[] { "No", "0" } }, "1",
@@ -159,6 +159,9 @@ namespace GowAscension
                     if (Ajustes.ContainsKey(m.Groups[1].Value)) Ajustes[m.Groups[1].Value] = m.Groups[2].Value;
             }
             catch { }
+            // un valor que ya no está en la lista (p. ej. el límite de 120 de la 1.1) vuelve al de por defecto
+            foreach (var o in Opciones)
+                if (!o.V.Any(v => v[1] == Ajustes[o.K])) Ajustes[o.K] = o.D;
         }
 
         void GuardarAjustes()

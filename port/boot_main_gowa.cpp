@@ -276,6 +276,7 @@ extern "C" void cellGcmTickVBlank(void);
 extern "C" void cellGcmTickFlip(void);
 extern "C" int  cellGcm_take_flip_pending(void);  /* hoisted to file scope: clang-cl rejects block-scope extern "C" */
 extern "C" int  cellGcm_flip_hold_us(void);       /* cellGcmSys.c: GOWA_FLIP_HZ */
+extern "C" DWORD g_tbt_main_tid;                  /* sys_timer.c: GOWA_TB_TRACE */
 
 static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
                                  uint64_t a2, uint64_t a3, uint64_t a4,
@@ -724,6 +725,86 @@ static DWORD WINAPI gowa_pin_thread(LPVOID)
     }
 }
 
+/* ---- GOWA: thread placement on a hybrid CPU (GOWA_PIN=4) ----------------------------------
+ * Opt-in only (see the measurement where GOWA_PIN is read). 25/10: on an i7-14700KF (8 P-cores
+ * with SMT + 12 E-cores) phase 1 ran at 49 fps in
+ * some runs and 72-78 in others with the same build and the same route: the main PPU thread
+ * (98% busy, the frame's critical path) and the RSX thread end up sharing a P-core with an SPU,
+ * or on an E-core, depending on where Windows puts them. Placement by role, re-applied every
+ * 4 s (threads that appear later get theirs on the next round):
+ *   main PPU thread -> P-core 0 alone     RSX-present -> P-core 1 alone
+ *   SPU0..SPU5      -> P-cores 2..7, one each (first logical CPU; the sibling stays idle)
+ *   everything else (SPU6, FG-present, fios, audio, driver threads...) -> the E-cores.
+ * With fewer than 8 P-cores the SPUs that do not fit go to the E-cores too. */
+static DWORD s_pin_main_tid;
+static DWORD WINAPI gowa_pin_hybrid_thread(LPVOID)
+{
+    const char* st = getenv("GOWA_PIN_START");
+    Sleep((st ? (DWORD)atoi(st) : 20u) * 1000u);
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+    uint8_t* buf = len ? (uint8_t*)malloc(len) : NULL;
+    if (!buf || !GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)buf, &len)) { free(buf); return 0; }
+    DWORD_PTR pfirst[64]; int np = 0; DWORD_PTR emask = 0; int emax = -1;
+    for (DWORD off = 0; off < len; ) {
+        const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(buf + off);
+        if (e->Processor.EfficiencyClass > emax) emax = e->Processor.EfficiencyClass;
+        off += e->Size;
+    }
+    for (DWORD off = 0; off < len; ) {
+        const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(buf + off);
+        const DWORD_PTR m = (DWORD_PTR)e->Processor.GroupMask[0].Mask;
+        if (m) {
+            if (e->Processor.EfficiencyClass == emax) { if (np < 64) pfirst[np++] = m & (~m + 1); }
+            else emask |= m;
+        }
+        off += e->Size;
+    }
+    free(buf);
+    DWORD_PTR proc_mask = 0, sys_mask = 0;
+    GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask);
+    emask &= proc_mask;
+    if (np < 2 || !emask) { fprintf(stderr, "[pin] hibrido: %d nucleos P, E=0x%llX -- nada a fazer\n", np, (unsigned long long)emask); return 0; }
+    fprintf(stderr, "[pin] hibrido: %d nucleos P (principal, RSX, SPU0-%d), resto nos nucleos E 0x%llX\n",
+            np, np - 3, (unsigned long long)emask);
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    static DWORD placed_tid[512]; static DWORD_PTR placed_mask[512]; int nplaced = 0;
+    for (int round = 0; ; round++) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) return 0;
+        THREADENTRY32 te; te.dwSize = sizeof te;
+        int changed = 0;
+        for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+            HANDLE h = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+            if (!h) continue;
+            WCHAR nm[24] = L"";
+            { PWSTR w = NULL; if (SUCCEEDED(GetThreadDescription(h, &w)) && w) { wcsncpy(nm, w, 23); LocalFree(w); } }
+            DWORD_PTR want = emask;
+            if (te.th32ThreadID == s_pin_main_tid) want = pfirst[0];
+            else if (!wcscmp(nm, L"RSX-present")) want = pfirst[1];
+            else if (nm[0] == L'S' && nm[1] == L'P' && nm[2] == L'U' && nm[3] >= L'0' && nm[3] <= L'9' && !nm[4]) {
+                const int k = 2 + (nm[3] - L'0');
+                if (k < np) want = pfirst[k];
+            }
+            want &= proc_mask;
+            if (!want) want = proc_mask;
+            int f = -1; for (int i = 0; i < nplaced; i++) if (placed_tid[i] == te.th32ThreadID) { f = i; break; }
+            if (f < 0 || placed_mask[f] != want) {
+                if (SetThreadAffinityMask(h, want)) {
+                    if (f < 0 && nplaced < 512) { f = nplaced++; placed_tid[f] = te.th32ThreadID; }
+                    if (f >= 0) placed_mask[f] = want;
+                    changed++;
+                }
+            }
+            CloseHandle(h);
+        }
+        CloseHandle(snap);
+        if (changed && (round < 3 || (round % 15) == 0)) fprintf(stderr, "[pin] hibrido rodada %d: %d threads colocadas\n", round, changed);
+        Sleep(4000);
+    }
+}
+
 /* ---- GOWA_TL=<início s>[:<duração s>[:<período µs>]] (22/10): linha do tempo ------------
  * Caminho crítico do quadro: a cada período (padrão 500 µs, timer de alta resolução) anota o
  * estado de cada SPU (workload LS 0x1DF, imagem em execução, bloqueada num canal, pc), da RSX
@@ -955,6 +1036,32 @@ static void gowa_hp_dllsym(uintptr_t pc, char* out, size_t n)
     if (best) snprintf(out, n, "%s!%s+0x%X", bn, best, rva - brva);
     else snprintf(out, n, "%s+0x%X", bn, rva);
 }
+/* From a sample inside a DLL, unwind to the first frame in this exe and return its
+ * function start (RVA), or 0. A thread suspended mid-prologue or in a kernel transition
+ * can leave a frame the unwinder reads garbage from (25/10: an access violation inside
+ * ntdll took the whole game down when the sampler started); such a sample is dropped. */
+static uintptr_t gowa_hp_unwind_to_self(const CONTEXT* start, HMODULE self)
+{
+    uintptr_t cr = 0;
+    __try {
+        CONTEXT uc = *start;
+        for (int d = 0; d < 24; d++) {
+            DWORD64 ib = 0;
+            PRUNTIME_FUNCTION uf = RtlLookupFunctionEntry(uc.Rip, &ib, NULL);
+            if (!uf) { uc.Rip = *(DWORD64*)uc.Rsp; uc.Rsp += 8; }
+            else { void* hd = NULL; DWORD64 ef = 0; RtlVirtualUnwind(UNW_FLAG_NHANDLER, ib, uc.Rip, uf, &uc, &hd, &ef, NULL); }
+            if (!uc.Rip) break;
+            HMODULE um = NULL;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)uc.Rip, &um);
+            if (um == self) {
+                DWORD64 sb = 0; PRUNTIME_FUNCTION sf = RtlLookupFunctionEntry(uc.Rip, &sb, NULL);
+                cr = sf ? (uintptr_t)sf->BeginAddress : (uintptr_t)(uc.Rip - (DWORD64)self);
+                break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { cr = 0; }
+    return cr;
+}
 static DWORD WINAPI gowa_hostprof_thread(LPVOID)
 {
     const char* e = getenv("GOWA_HOSTPROF");
@@ -1102,21 +1209,7 @@ static DWORD WINAPI gowa_hostprof_thread(LPVOID)
                             if (k->tid == thr[i].tid && k->pc == key) { k->n++; break; }
                         }
                         /* unwind out of the DLL to the first frame in this exe */
-                        CONTEXT uc = ctx; uintptr_t cr = 0;
-                        for (int d = 0; d < 24; d++) {
-                            DWORD64 ib = 0;
-                            PRUNTIME_FUNCTION uf = RtlLookupFunctionEntry(uc.Rip, &ib, NULL);
-                            if (!uf) { uc.Rip = *(DWORD64*)uc.Rsp; uc.Rsp += 8; }
-                            else { void* hd = NULL; DWORD64 ef = 0; RtlVirtualUnwind(UNW_FLAG_NHANDLER, ib, uc.Rip, uf, &uc, &hd, &ef, NULL); }
-                            if (!uc.Rip) break;
-                            HMODULE um = NULL;
-                            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)uc.Rip, &um);
-                            if (um == self) {
-                                DWORD64 sb = 0; PRUNTIME_FUNCTION sf = RtlLookupFunctionEntry(uc.Rip, &sb, NULL);
-                                cr = sf ? (uintptr_t)sf->BeginAddress : (uintptr_t)(uc.Rip - (DWORD64)self);
-                                break;
-                            }
-                        }
+                        const uintptr_t cr = gowa_hp_unwind_to_self(&ctx, self);
                         if (cr) {
                             const uint32_t vh = (uint32_t)((thr[i].tid * 2654435761u) ^ (uint32_t)(cr >> 4)) & (DN - 1);
                             for (int pr = 0; pr < 64; pr++) {
@@ -2282,6 +2375,24 @@ static DWORD WINAPI freeze_watch(LPVOID p)
     }
 }
 
+/* 25/10: a load that never finishes while the main loop keeps running (the user's session:
+ * "loading HecaBAS" with no "loaded", then "waiting for load save game" every 3 s forever)
+ * is invisible to hang_watchdog, which only looks at a frozen main thread. gowa_offline.cpp
+ * calls this when the game repeats that wait; the dump runs on its own thread, so the game
+ * thread that asked never suspends anything itself. */
+static DWORD WINAPI gowa_load_stall_dump(LPVOID)
+{
+    dump_threads("carga parada (waiting for load save game repetido)", GetModuleHandleA(NULL));
+    fflush(NULL);
+    return 0;
+}
+extern "C" void gowa_report_load_stall(void)
+{
+    static volatile LONG once = 0;
+    if (InterlockedExchange(&once, 1) == 0)
+        CreateThread(NULL, 0, gowa_load_stall_dump, NULL, 0, NULL);
+}
+
 static DWORD WINAPI hang_watchdog(LPVOID)
 {
     HMODULE self = NULL;
@@ -2751,6 +2862,7 @@ int main(int argc, char** argv)
         CreateThread(NULL, 0, gowa_hostprof_thread, NULL, 0, NULL);
     if (getenv("GOWA_TL"))
         CreateThread(NULL, 0, gowa_tl_thread, (LPVOID)(uintptr_t)GetCurrentThreadId(), 0, NULL);
+    g_tbt_main_tid = GetCurrentThreadId();   /* GOWA_TB_TRACE (sys_timer.c) */
     /* GOWA_PIN: padrão ligado desde 20/10 (A/B: cap. 16 +8,6%, fase 1 +8,3%); =0 desliga.
      * 25/10: só com 12 ou mais CPUs lógicas. Com ~9 threads pesadas, fixar as 4 mais
      * pesadas num i5-10300H (4 núcleos / 8 lógicas) tira do Windows a chance de usar a
@@ -2777,10 +2889,16 @@ int main(int argc, char** argv)
             hybrid = emax > emin;
         }
         free(buf); }
-      const int pin = pe ? (*pe != '0') : (si.dwNumberOfProcessors >= 12 && !hybrid);
-      if (hybrid && !pe) fprintf(stderr, "[pin] desligado: CPU hibrida (GOWA_PIN=1 forca)\n");
-      { extern int g_gowa_pin_on; g_gowa_pin_on = pin; }   /* desempenho.json */
-      if (pin) CreateThread(NULL, 0, gowa_pin_thread, NULL, 0, NULL);
+      /* 25/10: placement by role (GOWA_PIN=4, gowa_pin_hybrid_thread) only on request: on the
+       * i7-14700KF it was worse, phase 1 at 2K->4K FSR without the limiter 41.4 / 41.3 fps
+       * against 54.2 / 49.6 not pinned (interleaved runs). */
+      if (hybrid && !pe) fprintf(stderr, "[pin] desligado: CPU hibrida (GOWA_PIN=1 ou 4 forca)\n");
+      const int pin_h = pe && *pe == '4';
+      const int pin = !pin_h && (pe ? (*pe != '0') : (si.dwNumberOfProcessors >= 12 && !hybrid));
+      { extern int g_gowa_pin_on; g_gowa_pin_on = pin ? 1 : pin_h ? 4 : 0; }   /* desempenho.json */
+      s_pin_main_tid = GetCurrentThreadId();
+      if (pin_h) CreateThread(NULL, 0, gowa_pin_hybrid_thread, NULL, 0, NULL);
+      else if (pin) CreateThread(NULL, 0, gowa_pin_thread, NULL, 0, NULL);
       else if (!pe) fprintf(stderr, "[pin] desligado: %lu CPUs lógicas (fixa só com 12 ou mais; GOWA_PIN=1 força)\n", (unsigned long)si.dwNumberOfProcessors); }
     if (getenv("GOWA_GUESTPROF"))
         CreateThread(NULL, 0, gowa_guestprof_thread, NULL, 0, NULL);
