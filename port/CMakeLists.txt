@@ -101,7 +101,12 @@ if(GOWA_PGO STREQUAL "gen")
 elseif(GOWA_PGO STREQUAL "use")
     set(GOWA_PGO_FLAGS "/clang:-fprofile-instr-use=${GOWA_PGO_PROFILE};/clang:-Wno-profile-instr-unprofiled;/clang:-Wno-profile-instr-out-of-date;/clang:-Wno-backend-plugin")
 endif()
-if(GOWA_PGO_FLAGS)
+# GOWA_PGO_PPU_ONLY=ON (26/10): PGO only on the lifted PPU code (with GOWA_PGO_PPU). The
+# instrumented build with everything (runtime + SPU + PPU) fell to ~19 fps in the menu and
+# stopped presenting frames at ~55 s: every thread running lifted code updates the shared
+# counters.
+option(GOWA_PGO_PPU_ONLY "GOWA_PGO only on the lifted PPU code" OFF)
+if(GOWA_PGO_FLAGS AND NOT GOWA_PGO_PPU_ONLY)
     target_compile_options(ps3recomp_runtime PRIVATE ${GOWA_PGO_FLAGS})
 endif()
 
@@ -307,7 +312,7 @@ if(SPU_SOURCES)
         set(GOWA_SPU_MARCH "x86-64-v3" CACHE STRING "-march for the lifted SPU code (GOWA_SPU_X86_V3)")
         if(GOWA_SPU_X86_V3 AND MSVC)
             set(GOWA_SPU_OPTS "-O2;/GS-;/clang:-march=${GOWA_SPU_MARCH};/clang:-ffp-contract=off")
-            if(GOWA_PGO_FLAGS)
+            if(GOWA_PGO_FLAGS AND NOT GOWA_PGO_PPU_ONLY)
                 list(APPEND GOWA_SPU_OPTS ${GOWA_PGO_FLAGS})
             endif()
             set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "${GOWA_SPU_OPTS}")
@@ -447,6 +452,22 @@ elseif(MSVC)
 else()
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
         COMPILE_OPTIONS "-w;-ffp-contract=off")
+endif()
+# GOWA_PGO_PPU=ON (26/10): the GOWA_PGO flags also on the lifted PPU code. On an i7-14700KF
+# (no AVX-512) the frame waits on the main PPU thread, ~60% of it in lifted code (branchy
+# game logic: node graphs, state machines), the part PGO helps most. Off by default: every
+# lifted TU then depends on the profile.
+option(GOWA_PGO_PPU "Apply GOWA_PGO to the lifted PPU code too" OFF)
+if(GOWA_PGO_FLAGS AND GOWA_PGO_PPU)
+    foreach(src ${RECOMP_SOURCES})
+        get_source_file_property(opts "${src}" COMPILE_OPTIONS)
+        if(NOT opts)
+            set(opts "")
+        endif()
+        list(APPEND opts ${GOWA_PGO_FLAGS})
+        set_source_files_properties("${src}" PROPERTIES COMPILE_OPTIONS "${opts}")
+    endforeach()
+    message(STATUS "GOWA_PGO=${GOWA_PGO} tambien en el codigo PPU traducido")
 endif()
 
 # ---------------------------------------------------------------------------
