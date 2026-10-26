@@ -514,6 +514,9 @@ static u64 s_osd_alloc_fence[3];
 static u32 s_osd_ai, s_osd_falhou;
 static char s_osd_txt[96];
 static char s_osd_txt2[96];   /* GOWA: second line -- resolution (internal -> output, FSR) and frame generation */
+static char s_osd_txt3[96];   /* GOWA: third line -- the graphics card */
+static u32 s_osd_cw = 8, s_osd_ch = 14;   /* GOWA: font cell in pixels (ld_osd_pipeline) */
+static volatile LONG g_ld_fg_presents;    /* GOWA: frames the frame generation presented (meter) */
 int rsx_live_draw_framegen_on(void);
 int rsx_live_draw_res_text(char* out, unsigned cap);
 double rsx_live_draw_get_present_fps(void);
@@ -619,29 +622,44 @@ static int ld_osd_pipeline(void)
     if (s_osd_pso) return 1;
     if (s_osd_falhou) return 0;
     s_osd_falhou = 1;
-    /* a fonte: ASCII 32..127 em células de 8x14, uma linha por byte (bit 7 = coluna 0) */
-    u32 fonte[96 * 4]; memset(fonte, 0, sizeof fonte);
+    /* GOWA (25/10): the font is drawn at its final size, anti-aliased (grey levels), so
+     * it is not a blown-up 8x14 bitmap: cells of s_osd_cw x s_osd_ch pixels from the
+     * backbuffer's height (25 px at 2160p, 40% below the old 14 x 3), one byte of
+     * coverage per pixel, ASCII 32..127 (127 = the degree sign), up to 64 KB. */
+    { D3D12_RESOURCE_DESC bd0; g.backbuf[0]->lpVtbl->GetDesc(g.backbuf[0], &bd0);
+      int ch_px = (int)(bd0.Height * 0.0116 + 0.5);
+      if (ch_px < 13) ch_px = 13;
+      if (ch_px > 34) ch_px = 34;
+      s_osd_ch = (u32)ch_px; s_osd_cw = (u32)(ch_px * 0.55 + 0.5); }
+    const u32 cw = s_osd_cw, chh = s_osd_ch;
+    static u8 fonte[65536]; memset(fonte, 0, sizeof fonte);
     { HDC dc = CreateCompatibleDC(NULL);
       BITMAPINFO bi; memset(&bi, 0, sizeof bi);
-      bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = 8; bi.bmiHeader.biHeight = -14;
+      bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = (LONG)cw; bi.bmiHeader.biHeight = -(LONG)chh;
       bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
       u32* px = NULL;
       HBITMAP bm = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&px, NULL, 0) : NULL;
-      HFONT fo = CreateFontA(-12, 7, 0, 0, FW_BOLD, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             NONANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+      HFONT fo = CreateFontA(-(int)(chh - 2), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, ANSI_CHARSET, OUT_TT_ONLY_PRECIS, CLIP_DEFAULT_PRECIS,
+                             ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
       if (!bm || !fo) { if (bm) DeleteObject(bm); if (fo) DeleteObject(fo); if (dc) DeleteDC(dc); return 0; }
       HGDIOBJ ob = SelectObject(dc, bm), of = SelectObject(dc, fo);
       SetTextColor(dc, RGB(255, 255, 255)); SetBkColor(dc, RGB(0, 0, 0)); SetBkMode(dc, OPAQUE);
       for (int ch = 32; ch < 128; ch++) {
-          memset(px, 0, 8 * 14 * 4);
-          char s1 = ch == 127 ? (char)0xB0 : (char)ch; TextOutA(dc, 0, 1, &s1, 1); GdiFlush();   /* 127 = grau */
-          for (int y = 0; y < 14; y++) {
-              u32 b = 0;
-              for (int x = 0; x < 8; x++) if ((px[y * 8 + x] & 0xFF) > 96) b |= 0x80u >> x;
-              fonte[(ch - 32) * 4 + (y >> 2)] |= b << ((y & 3) * 8);
-          }
+          memset(px, 0, (size_t)cw * chh * 4);
+          char s1 = ch == 127 ? (char)0xB0 : (char)ch; TextOutA(dc, 0, 1, &s1, 1); GdiFlush();
+          for (u32 y = 0; y < chh; y++)
+              for (u32 x = 0; x < cw; x++) {
+                  const size_t i = (size_t)(ch - 32) * cw * chh + y * cw + x;
+                  if (i < sizeof fonte) fonte[i] = (u8)(px[y * cw + x] & 0xFF);
+              }
       }
       SelectObject(dc, ob); SelectObject(dc, of); DeleteObject(bm); DeleteObject(fo); DeleteDC(dc); }
+    /* GOWA_OSD_FONT_DUMP=<file.pgm>: the 96 glyphs side by side (diagnostic) */
+    { const char* fd = getenv("GOWA_OSD_FONT_DUMP");
+      if (fd) { FILE* f = fopen(fd, "wb");
+        if (f) { fprintf(f, "P5\n%u %u\n255\n", 96u * cw, chh);
+                 for (u32 y = 0; y < chh; y++) for (u32 c = 0; c < 96; c++) fwrite(&fonte[c * cw * chh + y * cw], 1, cw, f);
+                 fclose(f); } } }
     { D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
       D3D12_RESOURCE_DESC rd = {0}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = sizeof fonte;
       rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1; rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -662,25 +680,32 @@ static int ld_osd_pipeline(void)
                                                     &IID_ID3D12RootSignature, (void**)&s_osd_rs);
     sig->lpVtbl->Release(sig);
     if (FAILED(hr)) return 0;
+    /* p = x0, y0, cell w | cell h << 16, n chars; q = backbuffer w, h. The font: one
+     * coverage byte per pixel (char - 32) * w * h + y * w + x, 16 per uint4. */
     static const char src[] =
-        "cbuffer F : register(b0) { uint4 fonte[96]; };\n"
-        "cbuffer T : register(b1) { uint4 p; uint4 q; uint4 txt[6]; };\n"   /* p = x0, y0, escala, n; q = largura, altura */
+        "cbuffer F : register(b0) { uint4 fonte[4096]; };\n"
+        "cbuffer T : register(b1) { uint4 p; uint4 q; uint4 txt[6]; };\n"
         "uint comp(uint4 v, uint j) { return j == 0 ? v.x : j == 1 ? v.y : j == 2 ? v.z : v.w; }\n"
+        "uint byteat(uint i) { return (comp(fonte[i >> 4], (i >> 2) & 3) >> ((i & 3) * 8)) & 0xFF; }\n"
+        /* the text's vector by fixed indices: AMD's compiler mis-read txt[ci >> 4] (a dynamic
+         * index into root constants) when one pixel quad straddled two vectors -- marks from
+         * the wrong characters at columns 0, 16 and 32 */
+        "uint4 tv(uint j) { return j == 0 ? txt[0] : j == 1 ? txt[1] : j == 2 ? txt[2] : j == 3 ? txt[3] : j == 4 ? txt[4] : txt[5]; }\n"
         "float4 vs(uint id : SV_VertexID) : SV_Position {\n"
-        "    float2 c = float2(id & 1, id >> 1); float s = (float)p.z;\n"
-        "    float2 sz = float2(p.w * 8.0 * s + 8.0 * s, 14.0 * s + 6.0 * s);\n"
+        "    float2 c = float2(id & 1, id >> 1); float cw = (float)(p.z & 0xFFFF), ch = (float)(p.z >> 16);\n"
+        "    float2 sz = float2(p.w * cw + cw, ch + ch * 0.4);\n"
         "    float2 px = float2(p.x, p.y) + c * sz;\n"
         "    return float4(px.x / q.x * 2.0 - 1.0, 1.0 - px.y / q.y * 2.0, 0, 1); }\n"
         "float4 ps(float4 pos : SV_Position) : SV_Target {\n"
-        "    float s = (float)p.z; float4 fundo = float4(0, 0, 0, 0.6);\n"
-        "    float2 l = pos.xy - float2(p.x, p.y) - float2(4.0 * s, 3.0 * s);\n"
+        "    uint cw = p.z & 0xFFFF, ch = p.z >> 16; float4 fundo = float4(0.02, 0.02, 0.03, 0.62);\n"
+        "    int2 l = int2(pos.xy - float2(p.x, p.y) - float2(cw * 0.5, ch * 0.2));\n"
         "    if (l.x < 0 || l.y < 0) return fundo;\n"
-        "    uint ci = (uint)(l.x / (8.0 * s)), col = (uint)(l.x / s) & 7, lin = (uint)(l.y / s);\n"
-        "    if (ci >= p.w || lin >= 14) return fundo;\n"
-        "    uint code = (comp(txt[ci >> 4], (ci >> 2) & 3) >> ((ci & 3) * 8)) & 0xFF;\n"
+        "    uint ci = (uint)l.x / cw, col = (uint)l.x % cw, lin = (uint)l.y;\n"
+        "    if (ci >= p.w || lin >= ch) return fundo;\n"
+        "    uint code = (comp(tv(ci >> 4), (ci >> 2) & 3) >> ((ci & 3) * 8)) & 0xFF;\n"
         "    if (code < 32 || code > 127) return fundo;\n"
-        "    uint bits = (comp(fonte[code - 32], lin >> 2) >> ((lin & 3) * 8)) & 0xFF;\n"
-        "    return ((bits >> (7 - col)) & 1) ? float4(1.0, 1.0, 0.55, 1.0) : fundo; }\n";
+        "    float a = byteat((code - 32) * cw * ch + lin * cw + col) / 255.0;\n"
+        "    return lerp(fundo, float4(0.97, 0.97, 0.95, 1.0), a); }\n";
     ID3DBlob *vsb = NULL, *psb = NULL;
     if (FAILED(D3DCompile(src, sizeof src - 1, "ld_osd", NULL, NULL, "vs", "vs_5_0", 0, 0, &vsb, &err))) {
         if (err) { fprintf(stderr, "[osd] vs: %s\n", (const char*)err->lpVtbl->GetBufferPointer(err)); err->lpVtbl->Release(err); }
@@ -749,10 +774,18 @@ static void ld_osd_texto(void)
                  fps, fps > 0.05 ? 1000.0 / fps : 0.0, cpu, tc, gpu, tg, vram, ram);
         char res[64] = "";
         if (!rsx_live_draw_res_text(res, sizeof res)) snprintf(res, sizeof res, "--");
-        if (rsx_live_draw_framegen_on())
-            snprintf(s_osd_txt2, sizeof s_osd_txt2, "RES %s  FG SI (salida %.0f fps)", res, rsx_live_draw_get_present_fps());
+        if (rsx_live_draw_framegen_on()) {
+            /* frames on screen: the FG thread's presents (rsx_live_draw_get_present_fps only
+             * sees the RSX thread's) */
+            static LONG fg0; const LONG fg1 = g_ld_fg_presents;
+            const double fgfps = (fg1 - fg0) / seg; fg0 = fg1;
+            snprintf(s_osd_txt2, sizeof s_osd_txt2, "RES %s  FG SI (%.0f fps en pantalla)", res, fgfps);
+        }
         else
             snprintf(s_osd_txt2, sizeof s_osd_txt2, "RES %s  FG NO", res);
+        { extern char g_ld_gpu_nome[128]; extern unsigned g_ld_gpu_vram_mb;
+          if (g_ld_gpu_nome[0]) snprintf(s_osd_txt3, sizeof s_osd_txt3, "GPU %s (%u GB)", g_ld_gpu_nome, (g_ld_gpu_vram_mb + 512) / 1024);
+          else s_osd_txt3[0] = 0; }
     } else { snprintf(s_osd_txt, sizeof s_osd_txt, "FPS --"); s_osd_txt2[0] = 0; }
     t0 = agora.QuadPart; f0 = f1; i0 = i1; k0 = k1; u0 = u1;
 }
@@ -803,26 +836,69 @@ static void ld_osd_desenha(void)
     l->lpVtbl->SetGraphicsRootSignature(l, s_osd_rs);
     l->lpVtbl->SetGraphicsRootConstantBufferView(l, 0, s_osd_fonte->lpVtbl->GetGPUVirtualAddress(s_osd_fonte));
     u32 k[32]; memset(k, 0, sizeof k);
-    const u32 esc = bd.Height >= 1400 ? 3u : bd.Height >= 900 ? 2u : 1u;   /* legível de 720p a 4K */
-    const u32 n = (u32)strlen(s_osd_txt);
-    k[0] = 8u * esc; k[1] = 8u * esc; k[2] = esc; k[3] = n < 96 ? n : 96; k[4] = (u32)bd.Width; k[5] = (u32)bd.Height;
-    memcpy(&k[8], s_osd_txt, n < 96 ? n : 96);
-    l->lpVtbl->SetGraphicsRoot32BitConstants(l, 1, 32, k, 0);
+    /* GOWA: the lines one under the other, each in its own panel (cell s_osd_cw x
+     * s_osd_ch, panel height 1.4 cells) */
     l->lpVtbl->IASetPrimitiveTopology(l, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    l->lpVtbl->DrawInstanced(l, 4, 1, 0, 0);
-    { const u32 n2 = (u32)strlen(s_osd_txt2);   /* second line, one text row (14 px) + 4 below */
-      if (n2) {
-          memset(&k[8], 0, sizeof(u32) * 24);
-          k[1] = 8u * esc + 18u * esc; k[3] = n2 < 96 ? n2 : 96;
-          memcpy(&k[8], s_osd_txt2, n2 < 96 ? n2 : 96);
+    { const char* lineas[3] = { s_osd_txt, s_osd_txt2, s_osd_txt3 };
+      const u32 alto = s_osd_ch + (s_osd_ch * 2u) / 5u;
+      for (u32 li = 0, y = s_osd_cw; li < 3; li++) {
+          const u32 n = (u32)strlen(lineas[li]);
+          if (!n) continue;
+          memset(k, 0, sizeof k);
+          k[0] = s_osd_cw; k[1] = y; k[2] = s_osd_cw | (s_osd_ch << 16); k[3] = n < 96 ? n : 96;
+          k[4] = (u32)bd.Width; k[5] = (u32)bd.Height;
+          memcpy(&k[8], lineas[li], n < 96 ? n : 96);
           l->lpVtbl->SetGraphicsRoot32BitConstants(l, 1, 32, k, 0);
           l->lpVtbl->DrawInstanced(l, 4, 1, 0, 0);
+          y += alto;
       } }
+    /* GOWA_OSD_DUMP=<file.ppm>: once, at the meter's 900th frame, the backbuffer with the
+     * meter on it (diagnostic: LD_FRAME_DUMP reads surfaces before the meter is drawn) */
+    static const char* osd_dump = (const char*)-1; static u32 osd_frames; static ID3D12Resource* osd_rb; static u32 osd_pitch;
+    if (osd_dump == (const char*)-1) osd_dump = getenv("GOWA_OSD_DUMP");
+    const int dump_now = osd_dump && ++osd_frames == 900;
+    if (dump_now) {
+        osd_pitch = ((u32)bd.Width * 4 + 255) & ~255u;
+        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd = {0}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = (UINT64)osd_pitch * bd.Height;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (SUCCEEDED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                             NULL, &IID_ID3D12Resource, (void**)&osd_rb))) {
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            l->lpVtbl->ResourceBarrier(l, 1, &b);
+            D3D12_TEXTURE_COPY_LOCATION s = {0}, d = {0};
+            s.pResource = bb; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            d.pResource = osd_rb; d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            d.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM; d.PlacedFootprint.Footprint.Width = (UINT)bd.Width;
+            d.PlacedFootprint.Footprint.Height = bd.Height; d.PlacedFootprint.Footprint.Depth = 1; d.PlacedFootprint.Footprint.RowPitch = osd_pitch;
+            l->lpVtbl->CopyTextureRegion(l, &d, 0, 0, 0, &s, NULL);
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE; b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            l->lpVtbl->ResourceBarrier(l, 1, &b);
+        } else osd_rb = NULL;
+    }
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET; b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     l->lpVtbl->ResourceBarrier(l, 1, &b);
     l->lpVtbl->Close(l);
     ID3D12CommandList* lists[] = {(ID3D12CommandList*)l};
     g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+    if (dump_now && osd_rb) {
+        const u64 dv = ++s_osd_fv;
+        g.queue->lpVtbl->Signal(g.queue, s_osd_fence, dv);
+        if (SUCCEEDED(s_osd_fence->lpVtbl->SetEventOnCompletion(s_osd_fence, dv, s_osd_ev))) WaitForSingleObject(s_osd_ev, 5000);
+        u8* m = NULL; D3D12_RANGE rr = {0, (SIZE_T)osd_pitch * bd.Height};
+        if (SUCCEEDED(osd_rb->lpVtbl->Map(osd_rb, 0, &rr, (void**)&m))) {
+            FILE* f = fopen(osd_dump, "wb");
+            if (f) {
+                fprintf(f, "P6\n%u %u\n255\n", (u32)bd.Width, bd.Height);
+                for (u32 y = 0; y < bd.Height; y++)
+                    for (u32 x = 0; x < (u32)bd.Width; x++) fwrite(m + (size_t)y * osd_pitch + x * 4, 1, 3, f);
+                fclose(f);
+                fprintf(stderr, "[osd] captura con el medidor: %s\n", osd_dump);
+            }
+            D3D12_RANGE wr = {0, 0}; osd_rb->lpVtbl->Unmap(osd_rb, 0, &wr);
+        }
+        osd_rb->lpVtbl->Release(osd_rb); osd_rb = NULL;
+    }
     const u64 v = ++s_osd_fv;
     g.queue->lpVtbl->Signal(g.queue, s_osd_fence, v);
     s_osd_alloc_fence[ai] = v;
@@ -13732,6 +13808,7 @@ static int ld_fg_show(ID3D12Resource* src, int real, LONG gen)
     }
     ReleaseSRWLockExclusive(&s_present_lock);
     if (stale) return 0;
+    InterlockedIncrement(&g_ld_fg_presents);
     if (real) { s_fg.pending = 0; s_fg.n_real++; } else s_fg.n_interp++;
     ld_fg_log();
     return 1;
