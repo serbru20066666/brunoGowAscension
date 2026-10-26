@@ -19,9 +19,9 @@ Esta versión parte del port de [otavix010](https://github.com/otavix010/gow-asc
 | **Tarjetas AMD** | Arreglados dos fallos de dibujo que solo pasaban en AMD: un triángulo negro tapando la mitad de la cinemática de apertura y manchas en la piel de Kratos (la Furia salía gris). |
 | **FSR 1** | Renderizado a 1440p (o la resolución que elijas) escalado a la de tu monitor con FSR 1 (EASU + RCAS). |
 | **Generación de cuadros** | El juego sigue a sus 60 fps y en pantalla salen **120 cuadros por segundo**, sin bajar el rendimiento del juego (va en un hilo propio). |
-| **Lanzador** | Con el estilo de los menús del juego: prepara el juego la primera vez y tiene los ajustes importantes. |
+| **Lanzador `GowAscension.exe`** | Con el estilo de los menús del juego. La primera vez pide la carpeta de tu copia y lo prepara todo solo (descarga la actualización y el firmware de Sony e instala lo que falte); después, ajustes y **JUGAR**. |
 | **Pantalla completa** | Alt+Intro o F11 pasan de ventana a pantalla completa sin bordes (antes la imagen se congelaba). |
-| **Medidor en pantalla** | FPS, resolución, generación de cuadros, CPU, GPU y memoria (F10). |
+| **Medidor en pantalla** | FPS, resolución, generación de cuadros, modelo de tarjeta gráfica, CPU, GPU y memoria (F10). |
 
 ![Fase 1 a 4K con FSR 1](docs/imagenes/fase1_4k_fsr.jpg)
 
@@ -32,19 +32,21 @@ Esta versión parte del port de [otavix010](https://github.com/otavix010/gow-asc
 | Qué | Dónde |
 |---|---|
 | **El juego**: tu copia del disco de *God of War: Ascension*, europea (BCES01741) o americana (BCUS98232) | Una carpeta que contenga `PS3_GAME`. |
-| **La actualización 1.04** (gratuita, ~235 MB) | El lanzador la descarga del servidor oficial de Sony si no la tienes. |
-| **El firmware oficial del PS3** (gratuito) | Descarga `PS3UPDAT.PUP` de la [página oficial de PlayStation](https://www.playstation.com/es-es/support/hardware/ps3/system-software/) e instálalo en [RPCS3](https://rpcs3.net/download) con *File > Install Firmware*. RPCS3 solo se usa para eso. |
-| **Python 3.10+** y **Visual Studio 2022 Build Tools** con C++, "C++ Clang tools" y "C++ CMake tools" | `winget install Python.Python.3.12` y el instalador de Visual Studio. También vale un LLVM aparte en `C:\Program Files\LLVM`. |
+| **La actualización 1.04** (gratuita, ~235 MB) | El lanzador la descarga del servidor oficial de Sony. |
+| **El firmware oficial del PS3** (gratuito, ~200 MB) | El lanzador descarga `PS3UPDAT.PUP` del servidor oficial de Sony (o usa el que tengas en RPCS3). No hace falta RPCS3. |
+| **Python 3.10+** y **Visual Studio 2022 Build Tools** con C++ y Clang | Si faltan, el lanzador los instala con `winget` (te lo pregunta antes). También vale un LLVM aparte en `C:\Program Files\LLVM`. |
 
-### 2. Descarga este repositorio
+### 2. Descarga la última versión
 
-*Code > Download ZIP* o `git clone`, en una carpeta **sin espacios en la ruta** (por ejemplo `C:\Juegos\brunoGowAscension`).
+Baja el `.zip` de la [última versión](https://github.com/serbru20066666/brunoGowAscension/releases/latest) y descomprímelo entero en una carpeta **sin espacios en la ruta** (por ejemplo `C:\Juegos\brunoGowAscension`).
 
-### 3. Abre `Lanzador.cmd`
+### 3. Abre `GowAscension.exe`
 
 ![El lanzador](docs/imagenes/lanzador.jpg)
 
-La primera vez el lanzador muestra **PREPARAR JUEGO**: pide la carpeta de tu disco, la actualización 1.04 (o la descarga) y la carpeta de RPCS3 con el firmware (la busca sola en los sitios habituales). Después abre una consola que traduce y compila el juego para tu CPU: unos minutos en un PC de 8 núcleos, más en uno de 4. Cuando termina, el lanzador muestra **JUGAR**.
+1. **Elige la carpeta de tu copia del juego** (la que contiene `PS3_GAME`).
+2. **EMPEZAR**: el lanzador descarga la actualización 1.04 y el firmware de Sony, instala lo que falte y traduce y compila el juego para tu CPU, con el progreso en la ventana. Unos 8 minutos en un PC de 8 núcleos, más en uno de 4. Solo se hace una vez.
+3. Ya preparado, muestra los **ajustes** y **JUGAR**. Mientras juegas, el lanzador se oculta y vuelve al cerrar el juego.
 
 Ajustes del lanzador (se guardan en `%APPDATA%\GowAscensionLanzador\ajustes.json`):
 
@@ -52,13 +54,13 @@ Ajustes del lanzador (se guardan en `%APPDATA%\GowAscensionLanzador\ajustes.json
 - **Escalado FSR 1** y su **nitidez**: escala la imagen a la resolución de tu monitor, que se detecta sola.
 - **Modo de pantalla**: pantalla completa sin bordes o ventana de cualquier tamaño. Durante el juego, Alt+Intro o F11 alternan.
 - **Idioma**: español, inglés, francés o portugués.
-- **Límite de fps**: 60 o 30. El juego avanza parte de su lógica por cuadro, así que por encima de 60 todo iría más rápido.
+- **Límite de fps**: 60, 90, 120 o 30. Jugando, el juego casi nunca pasa de 60 por sí solo (lo frena la CPU), así que 90 y 120 apenas cambian nada; para 120 en pantalla, usa la generación de cuadros. El juego avanza parte de su lógica por cuadro: una escena que pase de 60 va más rápida.
 - **Generación de cuadros**: 120 cuadros por segundo en pantalla con el juego a 60. Activada por defecto con monitores de 100 Hz o más.
 - **Sincronía vertical**, **medidor en pantalla** (F10) y **sonido**.
 
 **CARPETA DEL JUEGO** cambia a otra copia del disco sin volver a compilar. Las partidas guardadas van a `saves\`; el registro de la última partida, a `out\jogo.log`.
 
-Sin lanzador: `gerar.cmd` (o `gerar.ps1 -Disco ... -Update ... -Firmware ...`) prepara el juego y `jogar.cmd` lo abre; las opciones son variables de entorno (`GOWA_RES_SCALE`, `GOWA_FSR`, `GOWA_FULLSCREEN`, `GOWA_LANG`, `GOWA_FRAMEGEN`, `GOWA_OSD`...). Detalles de la generación: [docs/COMO_GERAR.md](docs/COMO_GERAR.md) (en portugués).
+`Lanzador.cmd` abre el mismo lanzador como script de PowerShell. Sin lanzador: `gerar.cmd` (o `gerar.ps1 -Disco ... -Update ... -Firmware ...`) prepara el juego y `jogar.cmd` lo abre; las opciones son variables de entorno (`GOWA_RES_SCALE`, `GOWA_FSR`, `GOWA_FULLSCREEN`, `GOWA_LANG`, `GOWA_FRAMEGEN`, `GOWA_OSD`...). Detalles de la generación: [docs/COMO_GERAR.md](docs/COMO_GERAR.md) (en portugués).
 
 ## Rendimiento medido
 
@@ -83,7 +85,7 @@ El límite está en la CPU (el hilo principal del juego). Las CPUs con AVX-512 v
 - **El código y las herramientas: [MIT](LICENSE)**, de otavix010 y colaboradores y, los cambios de esta versión, de Bruno Cardenas Torres.
 - **[ps3recomp](https://github.com/sp00nznet/ps3recomp)**, de Ned Heller (sp00nznet), MIT: el traductor, el runtime y el motor de dibujo. Va dentro de `ps3recomp/`.
 - **[otavix010](https://github.com/otavix010/gow-ascension-pc)**: el port en el que se basa esta versión (su README original, en [docs/README.otavix.pt.md](docs/README.otavix.pt.md)).
-- **`scripts/gpl/unself.py` es GPL-2.0** (`scripts/gpl/COPYING`): el descifrador de SELF, que sigue el `unself.cpp` de [RPCS3](https://github.com/RPCS3/rpcs3) y corre como programa aparte.
+- **`scripts/gpl/unself.py` y `scripts/gpl/pup_libsre.py` son GPL-2.0** (`scripts/gpl/COPYING`): el descifrador de SELF y el extractor del firmware, que siguen el código de [RPCS3](https://github.com/RPCS3/rpcs3) y corren como programas aparte.
 - **Claves**: ninguna la hemos creado nosotros. Las de descifrado de ejecutables se leen del código fuente de RPCS3 (`gerar.ps1` descarga `key_vault.cpp/.h` en una versión fija); la KLIC del juego sale de tu propia copia.
 - **FSR 1**: implementación propia de los algoritmos publicados de AMD FidelityFX Super Resolution 1.0 (MIT).
 - **Fuente Cinzel** (`launcher/Cinzel-Black.ttf`): SIL Open Font License (`launcher/OFL-Cinzel.txt`).
@@ -94,4 +96,4 @@ El límite está en la CPU (el hilo principal del juego). Las CPUs con AVX-512 v
 
 ## English summary
 
-A **native PC port** of *God of War: Ascension* (PS3) by **static recompilation**, on top of [ps3recomp](https://github.com/sp00nznet/ps3recomp), based on [otavix010's port](https://github.com/otavix010/gow-ascension-pc) (its whole history is kept). **Bring your own copy**: no game code, data or firmware here. This fork adds European disc (BCES01741) support, full Spanish (voices and cinematics), fixes for two AMD-only rendering bugs, FSR 1 upscaling to the monitor's resolution, frame generation on its own thread (the game at 60 FPS and 120 frames/s on screen), Alt+Enter / F11 borderless full screen, an on-screen meter, and a launcher in the game's menu style that prepares the game on first run (it asks for your disc folder, downloads the free 1.04 update from Sony if needed and finds RPCS3's firmware). Open **`Lanzador.cmd`**. License: MIT for the code (otavix010 and contributors; this fork's changes by Bruno Cardenas Torres); `scripts/gpl/unself.py` is GPL-2.0. *God of War* is a trademark of Sony Interactive Entertainment; this is a non-commercial fan project, not affiliated with or endorsed by Sony.
+A **native PC port** of *God of War: Ascension* (PS3) by **static recompilation**, on top of [ps3recomp](https://github.com/sp00nznet/ps3recomp), based on [otavix010's port](https://github.com/otavix010/gow-ascension-pc) (its whole history is kept). **Bring your own copy**: no game code, data or firmware here. This fork adds European disc (BCES01741) support, full Spanish (voices and cinematics), fixes for two AMD-only rendering bugs, FSR 1 upscaling to the monitor's resolution, frame generation on its own thread (the game at 60 FPS and 120 frames/s on screen), Alt+Enter / F11 borderless full screen, an on-screen meter, and a launcher in the game's menu style (**`GowAscension.exe`** in the release zip) that prepares everything on first run: it asks for your disc folder, downloads the free 1.04 update and the official PS3 firmware from Sony, installs missing tools and compiles the game; then it shows the settings and PLAY. RPCS3 is not needed. License: MIT for the code (otavix010 and contributors; this fork's changes by Bruno Cardenas Torres); `scripts/gpl/unself.py` and `scripts/gpl/pup_libsre.py` are GPL-2.0. *God of War* is a trademark of Sony Interactive Entertainment; this is a non-commercial fan project, not affiliated with or endorsed by Sony.
