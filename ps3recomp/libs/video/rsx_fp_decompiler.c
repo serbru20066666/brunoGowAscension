@@ -1282,9 +1282,9 @@ static int rsx_fp_decompile_internal(
         char tail[192];
         snprintf(tail, sizeof(tail),
                  fp_nanint_on() ? "    float4 _o = %s[0];%s\n"
-                                  "    return ((asuint(_o) & 0x7FFFFFFFu) > 0x7F800000u) ? (float4)0 : _o;\n}\n"
+                                  "    return ((asuint(_o) & 0x7FFFFFFFu) > 0x7F800000u) ? FP_NANV : _o;\n}\n"
                                 : "    float4 _o = %s[0];%s\n"
-                                  "    return (_o == _o) ? _o : (float4)0;\n}\n", export_file,
+                                  "    return (_o == _o) ? _o : FP_NANV;\n}\n", export_file,
                  fp_clamp16_on() ? " _o = clamp(_o, -65504.0, 65504.0);" : "");
         out_puts(&o, tail);
     } else {
@@ -1300,13 +1300,13 @@ static int rsx_fp_decompile_internal(
             if (fp_nanint_on())
                 snprintf(line, sizeof(line),
                          "    float4 _o%u = %s[%u];%s\n"
-                         "    _out.t%u = ((asuint(_o%u) & 0x7FFFFFFFu) > 0x7F800000u) ? (float4)0 : _o%u;\n",
+                         "    _out.t%u = ((asuint(_o%u) & 0x7FFFFFFFu) > 0x7F800000u) ? FP_NANV : _o%u;\n",
                          t, export_file, fp_export_reg[half_exports][t], clampbuf,
                          t, t, t);
             else
             snprintf(line, sizeof(line),
                      "    float4 _o%u = %s[%u];%s\n"
-                     "    _out.t%u = (_o%u == _o%u) ? _o%u : (float4)0;\n",
+                     "    _out.t%u = (_o%u == _o%u) ? _o%u : FP_NANV;\n",
                      t, export_file, fp_export_reg[half_exports][t], clampbuf,
                      t, t, t, t);
             out_puts(&o, line);
@@ -1323,6 +1323,8 @@ static int rsx_fp_decompile_internal(
     char preamble[32768]; /* bounded room for all 16 comparison helpers */
     Out p = { preamble, sizeof(preamble), 0, 1 };
     preamble[0] = '\0';
+    { static int show = -1; if (show < 0) { const char* e = getenv("GOWA_FP_NAN_SHOW"); show = (e && *e == '1') ? 1 : 0; }
+      out_puts(&p, show ? "#define FP_NANV float4(1,0,1,1)\n" : "#define FP_NANV (float4)0\n"); }
     out_puts(&p,
         "struct PSInput {\n"
         "    float4 position : SV_POSITION; float4 col0 : COLOR0; float4 col1 : COLOR1;\n"

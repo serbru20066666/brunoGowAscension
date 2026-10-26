@@ -2292,6 +2292,18 @@ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
     sd.MaxLOD = mip_present ? (float)max_lod_fx / 256.0f : 0.0f;
     if (sd.MaxLOD < sd.MinLOD) sd.MaxLOD = sd.MinLOD;
     sd.MaxAnisotropy = 1;
+    /* GOWA (26/10): con la resolución escalada, el nivel de detalle más alto de las texturas de
+     * 2048x4096 o más (los cuerpos de los personajes) sale con puntos oscuros en la piel de
+     * Kratos (a 720p nativo no se usa). Esas texturas se muestrean con el sesgo de nivel de
+     * detalle de la escala (+1 a 2K): GOWA_BIG_TEX_BIAS=<float> lo fija, =0 lo quita.
+     * GOWA_LOD_BIAS=<float> (diagnóstico) sesga todas. */
+    { static int lb = -1; static float lbv, bbv;
+      if (lb < 0) { const char* e = getenv("GOWA_LOD_BIAS"); lb = e != NULL; lbv = e ? (float)atof(e) : 0.0f;
+                    const char* b = getenv("GOWA_BIG_TEX_BIAS");
+                    const float sc = (float)LD_PX(1024) / 1024.0f;
+                    bbv = b ? (float)atof(b) : (sc > 1.01f ? log2f(sc) : 0.0f); }
+      if (lb) sd.MipLODBias = lbv;
+      else if (bbv != 0.0f && mip_present && (u64)t->width * t->height >= 2048ull * 4096ull) sd.MipLODBias = bbv; }
     /* GOWA: TEXTURE_BORDER_COLOR (ARGB8) for BORDER addressing -- the
      * descriptor was left at transparent black, which a depth-compare unit
      * reads as depth 0: everything outside a shadow map came out shadowed.
@@ -2324,6 +2336,8 @@ static u64 sampler_key(const rsx_dsp_texture* t)
     /* GOWA: the border colour (decode_sampler) when a mode reads it */
     if (wrap_u == 4 || wrap_v == 4 || wrap_w == 4)
         key |= (u64)(((u32)t->border_color * 2654435761u) >> 11) << 43;
+    /* GOWA: textura grande con sesgo de nivel de detalle (decode_sampler) */
+    if ((u64)t->width * t->height >= 2048ull * 4096ull) key |= 1ull << 42;
     return key;
 }
 
@@ -7298,6 +7312,24 @@ ld_fp_hashed:
               if (f) { rsx_dsp_surface us; rsx_dsp_get_surface(&g.rsx, &us);
                        fprintf(f, "// alvo 0x%08X fmt=0x%X frame=%u pso=%016llx\n%s", us.color_offset[0], us.color_format, g_ld_frames, (unsigned long long)key, units);
                        fputs(ps_hlsl, f); fclose(f); }
+          }
+      } }
+    /* GOWA_DIAG_WHITE_OFF=<offset hex> (diagnostico): las lecturas de la textura en ese
+     * offset devuelven blanco (cada PSO al construirse). */
+    { static int dw = -1; static u32 doff;
+      if (dw < 0) { const char* e = getenv("GOWA_DIAG_WHITE_OFF"); dw = e != NULL; doff = e ? (u32)strtoul(e, 0, 16) : 0; }
+      for (u32 uu = 0; dw && fi > 0 && uu < 16; uu++) {
+        if (!ld_tx[uu].enabled || ld_tx[uu].offset != doff) continue;
+        char pat[2][32]; snprintf(pat[0], sizeof pat[0], "rsx_tex%u.Sample(", uu); snprintf(pat[1], sizeof pat[1], "rsx_tex[%u].Sample(", uu);
+        for (int k = 0; k < 2; k++)
+          for (char* st = strstr(ps_hlsl, pat[k]); st; st = strstr(st, pat[k])) {
+            char* p = st + strlen(pat[k]); int depth = 1;
+            while (*p && depth) { if (*p == '(') depth++; else if (*p == ')') depth--; p++; }
+            const char rep[] = "float4(1,1,1,1)";
+            const size_t used = strlen(ps_hlsl), old = (size_t)(p - st), rl = sizeof rep - 1;
+            if (rl > old) break;
+            memcpy(st, rep, rl); memmove(st + rl, p, used - (size_t)(p - ps_hlsl) + 1);
+            st += rl;
           }
       } }
     /* LD_HLSL_DUMP=<dir>: files named by the PSO key the draw CSV prints. */
