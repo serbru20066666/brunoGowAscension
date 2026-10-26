@@ -737,8 +737,14 @@ static DWORD WINAPI gowa_pin_thread(LPVOID)
  *   everything else (SPU6, FG-present, fios, audio, driver threads...) -> the E-cores.
  * With fewer than 8 P-cores the SPUs that do not fit go to the E-cores too. */
 static DWORD s_pin_main_tid;
-static DWORD WINAPI gowa_pin_hybrid_thread(LPVOID)
+/* GOWA_PIN=5 (soft, p != 0): the same roles, but only as the IDEAL processor
+ * (SetThreadIdealProcessor), and the other threads are left alone. 25/10: Windows gave the
+ * RSX thread and most SPUs an E-core as ideal processor (RSX 16, SPU0-4 22-27 on the
+ * i7-14700KF), so in some runs the frame's critical path ran on E-cores. SPU6 goes to the
+ * sibling of the last P-core. */
+static DWORD WINAPI gowa_pin_hybrid_thread(LPVOID soft_arg)
 {
+    const int soft = soft_arg != NULL;
     const char* st = getenv("GOWA_PIN_START");
     Sleep((st ? (DWORD)atoi(st) : 20u) * 1000u);
     DWORD len = 0;
@@ -781,11 +787,28 @@ static DWORD WINAPI gowa_pin_hybrid_thread(LPVOID)
             WCHAR nm[24] = L"";
             { PWSTR w = NULL; if (SUCCEEDED(GetThreadDescription(h, &w)) && w) { wcsncpy(nm, w, 23); LocalFree(w); } }
             DWORD_PTR want = emask;
-            if (te.th32ThreadID == s_pin_main_tid) want = pfirst[0];
-            else if (!wcscmp(nm, L"RSX-present")) want = pfirst[1];
+            int role = 0;
+            if (te.th32ThreadID == s_pin_main_tid) { want = pfirst[0]; role = 1; }
+            else if (!wcscmp(nm, L"RSX-present")) { want = pfirst[1]; role = 1; }
             else if (nm[0] == L'S' && nm[1] == L'P' && nm[2] == L'U' && nm[3] >= L'0' && nm[3] <= L'9' && !nm[4]) {
                 const int k = 2 + (nm[3] - L'0');
-                if (k < np) want = pfirst[k];
+                if (k < np) { want = pfirst[k]; role = 1; }
+                else if (soft) { want = pfirst[np - 1] << 1; role = 1; }   /* sibling of the last P-core */
+            }
+            if (soft) {
+                if (role) {
+                    int f = -1; for (int i = 0; i < nplaced; i++) if (placed_tid[i] == te.th32ThreadID) { f = i; break; }
+                    if (f < 0 || placed_mask[f] != want) {
+                        unsigned long bit = 0; _BitScanForward64(&bit, (unsigned long long)want);
+                        if (SetThreadIdealProcessor(h, (DWORD)bit) != (DWORD)-1) {
+                            if (f < 0 && nplaced < 512) { f = nplaced++; placed_tid[f] = te.th32ThreadID; }
+                            if (f >= 0) placed_mask[f] = want;
+                            changed++;
+                        }
+                    }
+                }
+                CloseHandle(h);
+                continue;
             }
             want &= proc_mask;
             if (!want) want = proc_mask;
@@ -2375,6 +2398,49 @@ static DWORD WINAPI freeze_watch(LPVOID p)
     }
 }
 
+/* GOWA_KICK=<1|2|3> (25/10, diagnostic): with GOWA_HOSTPROF on, phase 1 at 2K->4K FSR without
+ * the limiter ran at 66-73 fps against 46-54 without it (i7-14700KF, 3 + 4 runs). Each mode
+ * copies one side effect of the sampler, to find which one helps:
+ *   1 = a thread spinning at idle priority (keeps a CPU out of its idle states)
+ *   2 = every 2 ms, suspend each thread, read its context, resume it (what the sampler does)
+ *   3 = a thread that just wakes every 2 ms */
+static DWORD WINAPI gowa_kick_thread(LPVOID p)
+{
+    const int mode = (int)(intptr_t)p;
+    SetThreadDescription(GetCurrentThread(), L"kick");
+    if (mode == 1) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+        for (;;) _mm_pause();
+    }
+    if (mode == 3) for (;;) Sleep(2);
+    const DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    static HANDLE hs[512]; int n = 0; ULONGLONG last = 0;
+    for (;;) {
+        if (GetTickCount64() - last > 1000) {
+            last = GetTickCount64();
+            for (int i = 0; i < n; i++) CloseHandle(hs[i]);
+            n = 0;
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            THREADENTRY32 te; te.dwSize = sizeof te;
+            if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) {
+                do {
+                    if (te.th32OwnerProcessID != pid || te.th32ThreadID == me || n >= 512) continue;
+                    HANDLE h = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                    if (h) hs[n++] = h;
+                } while (Thread32Next(snap, &te));
+            }
+            if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
+        }
+        for (int i = 0; i < n; i++) {
+            if (SuspendThread(hs[i]) == (DWORD)-1) continue;
+            CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
+            GetThreadContext(hs[i], &c);
+            ResumeThread(hs[i]);
+        }
+        Sleep(2);
+    }
+}
+
 /* 25/10: a load that never finishes while the main loop keeps running (the user's session:
  * "loading HecaBAS" with no "loaded", then "waiting for load save game" every 3 s forever)
  * is invisible to hang_watchdog, which only looks at a frozen main thread. gowa_offline.cpp
@@ -2860,6 +2926,8 @@ int main(int argc, char** argv)
         CreateThread(NULL, 0, guest_prof_thread, NULL, 0, NULL);
     if (getenv("GOWA_HOSTPROF"))
         CreateThread(NULL, 0, gowa_hostprof_thread, NULL, 0, NULL);
+    if (const char* k = getenv("GOWA_KICK"))
+        if (atoi(k) >= 1 && atoi(k) <= 3) CreateThread(NULL, 0, gowa_kick_thread, (LPVOID)(intptr_t)atoi(k), 0, NULL);
     if (getenv("GOWA_TL"))
         CreateThread(NULL, 0, gowa_tl_thread, (LPVOID)(uintptr_t)GetCurrentThreadId(), 0, NULL);
     g_tbt_main_tid = GetCurrentThreadId();   /* GOWA_TB_TRACE (sys_timer.c) */
@@ -2893,11 +2961,11 @@ int main(int argc, char** argv)
        * i7-14700KF it was worse, phase 1 at 2K->4K FSR without the limiter 41.4 / 41.3 fps
        * against 54.2 / 49.6 not pinned (interleaved runs). */
       if (hybrid && !pe) fprintf(stderr, "[pin] desligado: CPU hibrida (GOWA_PIN=1 ou 4 forca)\n");
-      const int pin_h = pe && *pe == '4';
+      const int pin_h = pe && (*pe == '4' || *pe == '5');
       const int pin = !pin_h && (pe ? (*pe != '0') : (si.dwNumberOfProcessors >= 12 && !hybrid));
-      { extern int g_gowa_pin_on; g_gowa_pin_on = pin ? 1 : pin_h ? 4 : 0; }   /* desempenho.json */
+      { extern int g_gowa_pin_on; g_gowa_pin_on = pin ? 1 : pin_h ? (*pe - '0') : 0; }   /* desempenho.json */
       s_pin_main_tid = GetCurrentThreadId();
-      if (pin_h) CreateThread(NULL, 0, gowa_pin_hybrid_thread, NULL, 0, NULL);
+      if (pin_h) CreateThread(NULL, 0, gowa_pin_hybrid_thread, (LPVOID)(intptr_t)(*pe == '5'), 0, NULL);
       else if (pin) CreateThread(NULL, 0, gowa_pin_thread, NULL, 0, NULL);
       else if (!pe) fprintf(stderr, "[pin] desligado: %lu CPUs lógicas (fixa só com 12 ou mais; GOWA_PIN=1 força)\n", (unsigned long)si.dwNumberOfProcessors); }
     if (getenv("GOWA_GUESTPROF"))
