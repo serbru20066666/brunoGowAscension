@@ -87,6 +87,49 @@ def aplicar_pausa():
         print('pausa em', n, 'pontos ->', p.name)
 
 
+# efeitos -- interruptores dos parches "Disable Depth of Field" e "Disable Motion Blur" da
+# lista do RPCS3 (GOWA.SELF 1.04, ZEROx): o jogo le o indicador de ativado do efeito em
+# +0x20 do objeto logo depois de func_003AF988; o parche troca a leitura por 0. Aqui fica
+# em tempo de execucao: GOWA_NO_DOF=1, GOWA_NO_MB=1 (gowa_offline.cpp).
+EFEITOS_DECL = 'extern "C" int g_gowa_no_dof, g_gowa_no_mb; ' + MARCA
+EFEITOS = [('ctx->lr = 0x004342B0; func_003AF988(ctx);', 'if (g_gowa_no_dof) ctx->gpr[5] = 0; ' + MARCA),
+           ('ctx->lr = 0x00437804; func_003AF988(ctx);', 'if (g_gowa_no_mb) ctx->gpr[5] = 0; ' + MARCA)]
+LEITURA = 'ctx->gpr[5] = vm_read32(ctx->gpr[31] + 0x20);'
+
+
+def aplicar_efeitos():
+    for p in arquivos():
+        s = ler(p)
+        if not any(a in s for a, _ in EFEITOS):
+            continue
+        eol = '\r\n' if '\r\n' in s[:4000] else '\n'
+        linhas = s.split(eol)
+        n = 0
+        for chamada, linha in EFEITOS:
+            for i, ln in enumerate(linhas):
+                if chamada not in ln:
+                    continue
+                for k in range(i + 1, i + 6):
+                    if linhas[k].strip() == LEITURA:
+                        if MARCA not in linhas[k + 1]:
+                            linhas.insert(k + 1, '        ' + linha)
+                            n += 1
+                        break
+                else:
+                    print('NAO ACHEI a leitura depois de', chamada)
+                break
+        if not n:
+            print('efeitos ja aplicados:', p.name)
+            continue
+        s = eol.join(linhas)
+        if EFEITOS_DECL not in s:
+            i = s.find('#include')
+            j = s.find('\n', i) + 1
+            s = s[:j] + EFEITOS_DECL + eol + s[j:]
+        gravar(p, s)
+        print('efeitos em', n, 'pontos ->', p.name)
+
+
 def arquivos():
     return sorted(DIR.glob('ppu_recomp_[0-9][0-9][0-9].cpp'))
 
@@ -129,6 +172,7 @@ def aplicar():
     for fn in pend:
         print('NÃO ACHEI', fn)
     aplicar_pausa()
+    aplicar_efeitos()
 
 
 def tirar():

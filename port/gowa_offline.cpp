@@ -202,6 +202,12 @@ extern "C" __declspec(noinline) void spu_cru_check_store(void* ctx, uint32_t lsa
 extern "C" { volatile int g_gowa_jogando = 0; }   /* 25/10: ver o gancho do log do jogo */
 extern "C" void gowa_report_load_stall(void);     /* boot_main_gowa.cpp: carga parada */
 extern "C" { int g_gowa_edge_nocull = [] { const char* e = getenv("GOWA_EDGE_NOCULL"); return e ? atoi(e) : 0; }(); }
+/* GOWA_NO_DOF=1 / GOWA_NO_MB=1: parches "Disable Depth of Field" y "Disable Motion Blur" de
+ * RPCS3 (ZEROx), como remiendo del codigo traducido (scripts/remendos_ppu.py, efeitos).
+ * 26/10: por defecto los dos activos. Pelea del Hecatonquiro a 2K sin FSR, tope 60:
+ * 40,9/43,9/42,8 fps frente a 39,4/37,5/29,8 sin ellos. =0 vuelve a los efectos. */
+extern "C" { int g_gowa_no_dof = [] { const char* e = getenv("GOWA_NO_DOF"); return e ? atoi(e) : 1; }();
+             int g_gowa_no_mb = [] { const char* e = getenv("GOWA_NO_MB"); return e ? atoi(e) : 1; }(); }
 /* GOWA_PULA_LUZ=1: o 0x72DF80 pula a iluminação por vértice (0x73E0 + 6AC8/7040) -- experimento de
  * teto do EDGE na GPU (opção (a)): a luz sai errada na tela, o resto do job igual. */
 extern "C" { int g_gowa_pula_luz = [] { const char* e = getenv("GOWA_PULA_LUZ"); return e ? atoi(e) : 0; }(); }
