@@ -25,7 +25,7 @@ from pathlib import Path
 
 DIR = Path(_os_raiz.path.join(RAIZ, r'port\recompiled'))
 MARCA = '/*REMENDO*/'
-DECL = 'extern "C" void gowa_texstream_wait(void); ' + MARCA
+DECL = 'extern "C" void gowa_texstream_wait(void); extern "C" int g_gowa_no_mlaa; ' + MARCA
 
 # (função, linha a inserir logo após a abertura)
 ENTRADAS = [
@@ -34,6 +34,9 @@ ENTRADAS = [
     ('func_003973C8', 'gowa_texstream_wait(); ' + MARCA),   # escritores da tabela (carga de recurso,
     ('func_0039490C', 'gowa_texstream_wait(); ' + MARCA),   #  streaming) -- vistos com GOWA_TSRACE e
     ('func_00395AE8', 'gowa_texstream_wait(); ' + MARCA),   #  GOWA_WGUARD com o job em voo
+    # "Disable MLAA" do RPCS3 (illusion, ZEROx): sem os registros 4 e 6 (chamadas de 0x390724 e
+    # 0x390754); o byte 0x83CE77 vai a 0 em boot_main_gowa.cpp. GOWA_NO_MLAA (gowa_offline.cpp).
+    ('func_003903D8', 'if (g_gowa_no_mlaa && (ctx->lr == 0x00390728 || ctx->lr == 0x00390758)) return; ' + MARCA),
 ]
 
 

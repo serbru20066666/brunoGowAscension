@@ -252,6 +252,7 @@ static void derive_vfs_root(const char* eboot)
 
 /* Host-provided symbols the runtime + HLE libs need. */
 extern "C" uint8_t* vm_base = nullptr;
+extern "C" int g_gowa_no_mlaa;   /* gowa_offline.cpp */
 extern "C" { int g_gowa_vm_ww = 0; }   /* GOWA_TEX_WW: a reserva tem MEM_WRITE_WATCH */
 extern "C" uint32_t ppu_vm_size;   /* defined in ppu_loader.cpp (OOB guard) */
 extern "C" void lv2_init_syscalls(void);   /* runtime/syscalls/lv2_register.c */
@@ -2874,6 +2875,8 @@ int main(int argc, char** argv)
 
     uint32_t entry = ppu_load_elf(elf);
     if (!entry) { printf("load failed\n"); return 1; }
+    /* GOWA_NO_MLAA: el byte de datos del parche "Disable MLAA" de RPCS3 (era 1) */
+    { if (g_gowa_no_mlaa) { fprintf(stderr, "[no-mlaa] 0x83CE77 era %u -> 0\n", vm_base[0x0083CE77u]); vm_base[0x0083CE77u] = 0; } }
 
     derive_vfs_root(elf);
     printf("[boot] VFS root: %s\n", ppu_vfs_root);

@@ -207,7 +207,11 @@ extern "C" { int g_gowa_edge_nocull = [] { const char* e = getenv("GOWA_EDGE_NOC
  * 26/10: por defecto los dos activos. Pelea del Hecatonquiro a 2K sin FSR, tope 60:
  * 40,9/43,9/42,8 fps frente a 39,4/37,5/29,8 sin ellos. =0 vuelve a los efectos. */
 extern "C" { int g_gowa_no_dof = [] { const char* e = getenv("GOWA_NO_DOF"); return e ? atoi(e) : 1; }();
-             int g_gowa_no_mb = [] { const char* e = getenv("GOWA_NO_MB"); return e ? atoi(e) : 1; }(); }
+             int g_gowa_no_mb = [] { const char* e = getenv("GOWA_NO_MB"); return e ? atoi(e) : 1; }();
+/* GOWA_NO_MLAA=1: "Disable MLAA" de RPCS3 (illusion, ZEROx), APAGADO: en la pelea 27,6/35,0 fps
+ * frente a 43,3/44,3 sin el. Sin registrar los trabajos 4 y 6
+ * (remendo en func_003903D8) y el byte 0x83CE77 a 0 (boot_main_gowa.cpp). */
+             int g_gowa_no_mlaa = [] { const char* e = getenv("GOWA_NO_MLAA"); return e ? atoi(e) : 0; }(); }
 /* GOWA_PULA_LUZ=1: o 0x72DF80 pula a iluminação por vértice (0x73E0 + 6AC8/7040) -- experimento de
  * teto do EDGE na GPU (opção (a)): a luz sai errada na tela, o resto do job igual. */
 extern "C" { int g_gowa_pula_luz = [] { const char* e = getenv("GOWA_PULA_LUZ"); return e ? atoi(e) : 0; }(); }
