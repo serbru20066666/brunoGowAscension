@@ -161,8 +161,14 @@ Etapa '1_ferramentas' {
                   "`r`n    winget install Microsoft.VisualStudio.2022.BuildTools --override `"--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Llvm.Clang --add Microsoft.VisualStudio.Component.VC.CMake.Project --includeRecommended`""
     }
     if ($falta) { throw ("Falta instalar:`r`n  - " + ($falta -join "`r`n  - ")) }
-    & python -c "import Crypto" 2>$null
-    if ($LASTEXITCODE -ne 0) { Exec $LOG 'python -m pip install --user pycryptodome' }
+    # por cmd: no Windows PowerShell 5.1, com ErrorActionPreference=Stop, o traceback do python
+    # (sem pycryptodome) no stderr virava erro fatal em vez de cair na instalação
+    cmd /c 'python -c "import Crypto" >nul 2>nul'
+    if ($LASTEXITCODE -ne 0) {
+        Exec $LOG 'python -m pip install --user pycryptodome'
+        cmd /c 'python -c "import Crypto" >nul 2>nul'
+        if ($LASTEXITCODE -ne 0) { throw 'não consegui instalar o pycryptodome (python -m pip install --user pycryptodome)' }
+    }
     $ff = Join-Path $R "dl\ffmpeg9\$FFMPEG_NOME"
     if (-not (Test-Path "$ff\include\libavcodec")) {
         Msg "baixando o FFmpeg 9 (LGPL) de $FFMPEG_URL"
