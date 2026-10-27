@@ -369,6 +369,9 @@ namespace GowAscension
                 return;
             }
             if (Listo) { MostrarMenu(); Estado.Text = "Listo para jugar"; }
+            else if (Raiz.Contains(" "))
+                MostrarPrep("CAMBIA LA CARPETA", "La carpeta del proyecto tiene espacios en la ruta:\n" + Raiz +
+                    "\n\nLas herramientas de compilación fallan con espacios. Mueve la carpeta entera a una ruta sin espacios (por ejemplo C:\\Juegos\\brunoGowAscension) y vuelve a abrir GowAscension.exe desde allí.", null, null, null, null);
             else if (!disco) PasoCarpeta();
             else PasoPreparar(null);
         }
@@ -419,14 +422,30 @@ namespace GowAscension
         {
             var d = new WF.FolderBrowserDialog { Description = "Carpeta de tu copia de God of War: Ascension (la que contiene PS3_GAME)", ShowNewFolderButton = false };
             if (d.ShowDialog() != WF.DialogResult.OK) return;
-            string disco = d.SelectedPath;
-            if (System.IO.Path.GetFileName(disco).Equals("PS3_GAME", StringComparison.OrdinalIgnoreCase)) disco = System.IO.Path.GetDirectoryName(disco);
-            if (!Directory.Exists(System.IO.Path.Combine(disco, "PS3_GAME", "USRDIR")))
+            string disco = BuscarCopia(d.SelectedPath);
+            if (disco == null)
             {
-                MessageBox.Show(this, "En esa carpeta no hay PS3_GAME\\USRDIR:\n" + disco + "\n\nElige la carpeta que contiene PS3_GAME.", Title, MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show(this, "En esa carpeta no hay PS3_GAME\\USRDIR:\n" + d.SelectedPath + "\n\nElige la carpeta que contiene PS3_GAME.", Title, MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
             PasoPreparar(disco);
+        }
+
+        // La carpeta de la copia (la que contiene PS3_GAME\USRDIR) a partir de la elegida: sirve
+        // elegir esa, PS3_GAME, USRDIR, o la carpeta de encima si dentro hay una sola copia.
+        static string BuscarCopia(string sel)
+        {
+            Func<string, bool> es = p => p != null && Directory.Exists(System.IO.Path.Combine(p, "PS3_GAME", "USRDIR"));
+            try
+            {
+                var p = sel.TrimEnd('\\', '/');
+                for (int i = 0; i < 3 && p != null; i++, p = System.IO.Path.GetDirectoryName(p))
+                    if (es(p)) return p;
+                var hijas = Directory.GetDirectories(sel).Where(es).ToArray();
+                if (hijas.Length == 1) return hijas[0];
+            }
+            catch { }
+            return null;
         }
 
         // ---------------------------------------------------------------- 2. herramientas

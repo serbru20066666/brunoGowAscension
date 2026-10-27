@@ -183,7 +183,19 @@ Etapa '2_jogo' {
     $vfs = Join-Path $R 'vfs'
     New-Item -ItemType Directory -Force $vfs | Out-Null
     $pg = Join-Path $vfs 'PS3_GAME'
-    if (-not (Test-Path $pg)) { Exec $LOG "mklink /J `"$pg`" `"$(Join-Path $Disco 'PS3_GAME')`"" }   # sem copiar 34 GB
+    $dt = Join-Path $R 'disco.txt'
+    if (Test-Path $dt) { Remove-Item $dt -Force }
+    if (-not (Test-Path $pg)) {   # enlace, sem copiar 34 GB
+        Add-Content -Path $LOG -Value "`r`n> mklink /J `"$pg`"" -Encoding UTF8
+        cmd /c "mklink /J `"$pg`" `"$(Join-Path $Disco 'PS3_GAME')`" >> `"$LOG`" 2>&1"
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $pg 'USRDIR'))) {
+            # disco sem enlaces (exFAT, FAT32): a pasta da copia vai em disco.txt (o lançador e o
+            # jogar.cmd usam como PS3_VFS_ROOT; os dados do update ficam em vfs)
+            if (Test-Path $pg) { cmd /c "rmdir `"$pg`"" }
+            [IO.File]::WriteAllText($dt, $Disco, (New-Object Text.UTF8Encoding $false))
+            Msg "este disco nao aceita enlaces: a pasta do jogo fica em disco.txt"
+        }
+    }
 
     $upd = $Update
     if ((Test-Path $Update -PathType Leaf) -and $Update -match '\.pkg$') {
@@ -320,6 +332,7 @@ Etapa '7_jogar' {
         'setlocal',
         'set "RAIZ=%~dp0"',
         'set "PS3_VFS_ROOT=%RAIZ%vfs"',
+        'if exist "%RAIZ%disco.txt" (set /p PS3_VFS_ROOT=<"%RAIZ%disco.txt" & set "PS3_HDD0_ROOT=%RAIZ%vfs")',
         'set "PS3_LIBSRE_IMAGE=%RAIZ%fw\lle\libsre_image.bin"',
         'if not defined PS3_SAVE_ROOT set "PS3_SAVE_ROOT=%RAIZ%saves"',
         'if not exist "%PS3_SAVE_ROOT%" mkdir "%PS3_SAVE_ROOT%"',
